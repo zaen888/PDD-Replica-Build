@@ -203,7 +203,7 @@ static void PDDShareTXTFiles(void) {
             if (!presenter) return;
             while (presenter.presentedViewController) presenter = presenter.presentedViewController;
             UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[zipURL] applicationActivities:nil];
-            if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+            if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
                 share.popoverPresentationController.sourceView = presenter.view;
                 share.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
             }
