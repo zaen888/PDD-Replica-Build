@@ -20,7 +20,8 @@ jobs:
         unzip -q master.zip -d $THEOS/sdks
         mv $THEOS/sdks/sdks-master/* $THEOS/sdks/
         rm -rf $THEOS/sdks/sdks-master master.zip
-
+    - name: Install ldid
+      run: brew install ldid
     - name: Build package
       run: |
         export THEOS=~/theos
