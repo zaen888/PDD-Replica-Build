@@ -1,0 +1,17 @@
+# macOS 系統檔案
+.DS_Store
+
+# Theos 編譯產生的資料夾與檔案
+.theos/
+packages/
+.build/
+layout/
+
+# 編譯出來的二進位檔與安裝包
+*.deb
+*.dylib
+*.o
+
+# 編輯器暫存檔
+*.swp
+*~
