@@ -1,9 +1,0 @@
-Package: com.local.pddreplicashell
-Name: PDD Replica Shell (Capture Test Build)
-Version: 0.4.0
-Architecture: iphoneos-arm
-Description: Native iOS tweak scaffold for local product JSON capture validation and TXT ZIP export.
-Maintainer: local
-Author: local
-Section: Tweaks
-Depends: firmware (>= 14.0)
