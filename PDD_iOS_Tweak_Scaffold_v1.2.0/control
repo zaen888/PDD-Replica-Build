@@ -1,0 +1,9 @@
+Package: com.local.pddreplicashell
+Name: PDD ReplicaShell (Development Build)
+Version: 1.2.0
+Architecture: iphoneos-arm
+Description: Development branch for automatic search and continuous product capture; retains the existing capture/upload core.
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: firmware (>= 14.0)
