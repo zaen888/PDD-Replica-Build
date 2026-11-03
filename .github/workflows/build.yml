@@ -1,52 +1,41 @@
-```yaml
 name: Build PDD ReplicaShell 1.2.0 Dev
 
 on:
   push:
-    branches:
-      - feature/1.2.0-auto-search
+    branches: [ main, feature/1.2.0-auto-search ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Setup Theos
-        run: |
-          export THEOS="$HOME/theos"
-          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+    - name: Setup Theos
+      run: |
+        export THEOS=~/theos
+        git clone --recursive https://github.com/theos/theos.git $THEOS
+        curl -LO https://github.com/theos/sdks/archive/master.zip
+        unzip -q master.zip -d $THEOS/sdks
+        mv $THEOS/sdks/sdks-master/* $THEOS/sdks/
+        rm -rf $THEOS/sdks/sdks-master master.zip
 
-          mkdir -p "$THEOS/sdks"
-          curl -L https://github.com/theos/sdks/archive/master.zip -o sdks.zip
-          unzip -q sdks.zip -d sdk-temp
-          cp -R sdk-temp/sdks-master/. "$THEOS/sdks/"
-          rm -rf sdks.zip sdk-temp
+    - name: Install ldid and dpkg
+      run: |
+        brew install ldid dpkg
 
-      - name: Install build dependencies
-        run: |
-          brew install ldid
+    - name: Build package
+      run: |
+        export THEOS=~/theos
+        cd PDD_iOS_Tweak_Scaffold_v1.2.0
+        make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
 
-      - name: Build package
-        run: |
-          export THEOS="$HOME/theos"
-          cd PDD_iOS_Tweak_Scaffold_v1.2.0
-          make clean package
-
-      - name: Upload DEB package
-        uses: actions/upload-artifact@v4
-        with:
-          name: PDD-ReplicaShell-1.2.0-Dev
-          path: PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
-          if-no-files-found: error
-
-      - name: Upload compiled dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: PDD-ReplicaShell-1.2.0-Dylib
-          path: PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
-          if-no-files-found: warn
-```
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: PDD-ReplicaShell-1.2.0-Dev
+        path: |
+          PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
+          PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
+        if-no-files-found: warn
