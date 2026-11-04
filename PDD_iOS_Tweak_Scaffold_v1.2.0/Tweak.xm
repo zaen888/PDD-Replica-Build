@@ -29,6 +29,15 @@ static BOOL gUploadBusy = NO;
 static NSString *gAutoSearchTaskID = nil;
 static NSUInteger gAutoSearchAttempts = 0;
 static BOOL gAutoSearchSubmitted = NO;
+// 1.2.4 sequential collector state. 0=idle, 1=waiting results, 2=selecting card,
+// 3=waiting server-confirmed upload, 4=returning, 5=3-second spacing, 6=paused,
+// 7=waiting for the selected card to open its detail page.
+static NSInteger gAutoCollectState = 0;
+static NSMutableSet<NSString *> *gAutoVisitedIndexPaths = nil;
+static NSString *gAutoExpectedGoodsID = nil;
+static NSUInteger gAutoScrollAttempts = 0;
+static NSUInteger gAutoPhaseTicks = 0;
+static BOOL gAutoTickScheduled = NO;
 
 static NSString *PDDDataDirectory(void);
 static void PDDShowMessage(NSString *title, NSString *message);
@@ -38,6 +47,9 @@ static void PDDStartCloudWorker(void);
 static void PDDShowControlMenu(UIButton *button);
 static void PDDConfigureCloud(void);
 static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword);
+static void PDDAutoCollectTick(void);
+static void PDDAutoScheduleTick(NSTimeInterval delay);
+static void PDDAutoUploadConfirmed(NSString *goodsID);
 
 static BOOL PDDCaptureEnabled(void) {
     @synchronized ([UIApplication class]) { return gEnabled; }
@@ -69,6 +81,9 @@ static void PDDCaptureRawJSON(NSData *data, NSString *goodsID) {
     // Bind a capture to the task that was active when the parser returned.
     // This prevents a queued disk write from being attached to a later task.
     NSDictionary *taskSnapshot = PDDActiveTaskSnapshot();
+    // During a cloud task, associate uploads only with JSON observed after a
+    // product-card selection has started; do not turn search-list payloads into task captures.
+    if (taskSnapshot && gAutoCollectState != 2 && gAutoCollectState != 3 && gAutoCollectState != 7) taskSnapshot = nil;
     NSData *snapshot = [data copy];
     dispatch_async(gCaptureQueue, ^{
         NSFileManager *fm = NSFileManager.defaultManager;
@@ -328,13 +343,20 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         if (submit && submit.enabled) {
             [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
             gAutoSearchSubmitted = YES;
+            gAutoCollectState = 1;
+            gAutoPhaseTicks = 0;
             NSLog(@"[PDDReplica] auto search submitted via identified button task=%@", taskID);
+            PDDAutoScheduleTick(1.0);
             return;
         }
         // If no positively identified search button exists, use the text field's standard return action.
         [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+        gAutoSearchSubmitted = YES;
+        gAutoCollectState = 1;
+        gAutoPhaseTicks = 0;
         NSLog(@"[PDDReplica] emitted standard text-field return event task=%@", taskID);
         NSLog(@"[PDDReplica] search keyword filled; submit control not safely identified task=%@", taskID);
+        PDDAutoScheduleTick(1.0);
         return;
     }
 
@@ -355,6 +377,11 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
     gAutoSearchTaskID = [taskID copy];
     gAutoSearchAttempts = 0;
     gAutoSearchSubmitted = NO;
+    gAutoCollectState = 0;
+    gAutoExpectedGoodsID = nil;
+    gAutoScrollAttempts = 0;
+    gAutoPhaseTicks = 0;
+    gAutoVisitedIndexPaths = [NSMutableSet set];
     UIPasteboard.generalPasteboard.string = keyword;
     // First attempt is delayed to allow the task notification/UI transition to settle.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -383,7 +410,7 @@ static BOOL PDDSetActiveTask(NSDictionary *task, BOOL notify) {
         }
         if (notify && isNew) {
             PDDStartAutoSearchForTask(taskID, keyword);
-            PDDShowMessage(@"收到本地採集任務（1.2.0 開發版）", [NSString stringWithFormat:@"關鍵詞：%@\n目標商品：%lu\n正在嘗試識別搜尋輸入框。若無法安全識別，會保留剪貼簿回退，不會盲目點擊商品。商品遍歷仍未啟用。", keyword, (unsigned long)gActiveTargetCount]);
+            PDDShowMessage(@"收到本地採集任務（1.2.4）", [NSString stringWithFormat:@"關鍵詞：%@\n目標商品：%lu（最多 3 件）\n將依序搜尋、打開商品、等待伺服器確認上傳，再返回採集下一件。", keyword, (unsigned long)MIN(MAX(gActiveTargetCount, 1), 3)]);
         }
     });
     return isNew;
@@ -391,6 +418,8 @@ static BOOL PDDSetActiveTask(NSDictionary *task, BOOL notify) {
 
 static void PDDClearActiveTask(void) {
     gAutoSearchTaskID = nil; gAutoSearchAttempts = 0; gAutoSearchSubmitted = NO;
+    gAutoCollectState = 0; gAutoExpectedGoodsID = nil; gAutoScrollAttempts = 0; gAutoPhaseTicks = 0;
+    gAutoVisitedIndexPaths = [NSMutableSet set];
     @synchronized ([UIApplication class]) {
         gActiveTaskID = nil; gActiveKeyword = nil; gActiveTargetCount = 0; gActiveSavedCount = 0;
     }
@@ -474,6 +503,8 @@ static void PDDHandleUploadSuccess(NSDictionary *envelope, NSDictionary *respons
     NSUInteger saved = [response[@"saved_count"] respondsToSelector:@selector(unsignedIntegerValue)] ? [response[@"saved_count"] unsignedIntegerValue] : 0;
     BOOL completed = [response[@"task_completed"] boolValue];
     @synchronized ([UIApplication class]) { gActiveSavedCount = saved; }
+    NSString *uploadedGoodsID = [envelope[@"goods_id"] isKindOfClass:NSString.class] ? envelope[@"goods_id"] : nil;
+    if (uploadedGoodsID.length) PDDAutoUploadConfirmed(uploadedGoodsID);
     if (completed) {
         PDDShowMessage(@"採集任務完成", [NSString stringWithFormat:@"%@\n成功上傳 %lu 件商品。", gActiveKeyword ?: @"", (unsigned long)saved]);
         PDDClearActiveTask();
@@ -579,7 +610,7 @@ static void PDDCloudTick(void) {
         gHeartbeatInFlight = YES;
         NSString *activeID = active[@"task_id"] ?: @"";
         NSDictionary *body = @{ @"app_version": [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"unknown",
-                                 @"plugin_version": @"1.2.0-dev", @"app_active": @YES, @"active_task_id": activeID };
+                                 @"plugin_version": @"1.2.4", @"app_active": @YES, @"active_task_id": activeID };
         PDDCloudRequest(@"/api/v1/device/heartbeat", body, ^(NSDictionary *result, NSError *error, NSInteger statusCode) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 gHeartbeatInFlight = NO;
@@ -809,6 +840,191 @@ static BOOL PDDFindTestCollection(UIView *view, UICollectionView **collectionOut
     return NO;
 }
 
+static BOOL PDDViewTreeContainsClass(UIView *view, NSString *needle) {
+    if (!view || !needle.length || view.hidden || view.alpha < 0.05) return NO;
+    if ([NSStringFromClass(view.class) containsString:needle]) return YES;
+    for (UIView *child in view.subviews) if (PDDViewTreeContainsClass(child, needle)) return YES;
+    return NO;
+}
+
+static UIButton *PDDFindDetailBackButton(UIView *view) {
+    if (!view || view.hidden || view.alpha < 0.05) return nil;
+    BOOL inKnownBackContainer = [NSStringFromClass(view.class) containsString:@"PDDGoodsDetailBottomButtonView"];
+    if (inKnownBackContainer) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:view];
+        while (stack.count) {
+            UIView *node = stack.lastObject; [stack removeLastObject];
+            if ([node isKindOfClass:UIButton.class]) {
+                UIButton *button = (UIButton *)node;
+                NSString *title = [button titleForState:UIControlStateNormal] ?: @"";
+                NSString *label = button.accessibilityLabel ?: @"";
+                NSString *identifier = button.accessibilityIdentifier ?: @"";
+                if (button.enabled && ([title containsString:@"返回"] || [label containsString:@"返回"] || [identifier containsString:@"back"])) return button;
+            }
+            for (UIView *child in node.subviews) [stack addObject:child];
+        }
+    }
+    for (UIView *child in view.subviews) {
+        UIButton *found = PDDFindDetailBackButton(child);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void PDDAutoScheduleTick(NSTimeInterval delay) {
+    if (gAutoTickScheduled || gAutoCollectState == 0 || gAutoCollectState == 6) return;
+    gAutoTickScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(0.2, delay) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        gAutoTickScheduled = NO;
+        PDDAutoCollectTick();
+    });
+}
+
+static void PDDAutoPause(NSString *reason) {
+    gAutoCollectState = 6;
+    NSLog(@"[PDDReplica] auto collector paused: %@", reason ?: @"unknown");
+    PDDShowMessage(@"自動採集已暫停", reason ?: @"目前無法安全繼續。請檢查畫面後再處理。");
+}
+
+static void PDDAutoCollectTick(void) {
+    if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ PDDAutoCollectTick(); }); return; }
+    NSDictionary *active = PDDActiveTaskSnapshot();
+    if (!active || ![active[@"task_id"] isEqualToString:gAutoSearchTaskID] || !PDDCaptureEnabled()) {
+        gAutoCollectState = 0; return;
+    }
+    NSUInteger target = [active[@"target_count"] unsignedIntegerValue];
+    NSUInteger saved = [active[@"saved_count"] unsignedIntegerValue];
+    if (target < 1) target = 1;
+    if (target > 3) target = 3;
+    if (saved >= target) return;
+    UIWindow *window = PDDActiveWindow();
+    if (!window) { PDDAutoPause(@"找不到拼多多活動視窗。"); return; }
+
+    BOOL isDetail = PDDViewTreeContainsClass(window, @"PDDGoodsDetailContentView");
+    UICollectionView *collection = nil; NSIndexPath *indexPath = nil; NSString *reason = nil;
+    BOOL isResults = PDDFindTestCollection(window, &collection, &indexPath, &reason);
+
+    if (gAutoCollectState == 1) { // wait for search result cards
+        if (isDetail) { PDDAutoPause(@"搜尋後意外進入商品詳情頁，為避免誤採集已停止。"); return; }
+        if (!isResults) {
+            if (++gAutoPhaseTicks > 45) { PDDAutoPause(@"等待搜尋結果超過 45 秒。請確認關鍵詞已成功搜尋，再重新領取任務。"); return; }
+            PDDAutoScheduleTick(1.0); return;
+        }
+        gAutoPhaseTicks = 0;
+        gAutoCollectState = 2;
+    }
+
+    if (gAutoCollectState == 2) { // choose one visible, not-yet-visited card
+        if (isDetail) {
+            gAutoCollectState = 3; gAutoPhaseTicks = 0;
+            if (gAutoExpectedGoodsID.length) { PDDAutoUploadConfirmed(gAutoExpectedGoodsID); return; }
+            PDDAutoScheduleTick(0.8); return;
+        }
+        if (!isResults || !collection) {
+            if (++gAutoPhaseTicks > 30) { PDDAutoPause(@"無法確認搜尋結果列表仍在畫面上。"); return; }
+            PDDAutoScheduleTick(0.8); return;
+        }
+        NSArray<NSIndexPath *> *paths = [collection.indexPathsForVisibleItems sortedArrayUsingComparator:^NSComparisonResult(NSIndexPath *a, NSIndexPath *b) {
+            if (a.section != b.section) return a.section < b.section ? NSOrderedAscending : NSOrderedDescending;
+            if (a.item != b.item) return a.item < b.item ? NSOrderedAscending : NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        NSIndexPath *chosen = nil;
+        for (NSIndexPath *path in paths) {
+            UICollectionViewCell *cell = [collection cellForItemAtIndexPath:path];
+            if (!cell || ![NSStringFromClass(cell.class) containsString:@"PDDSRDoubleColNormalGoodsCell"]) continue;
+            NSString *key = [NSString stringWithFormat:@"%ld-%ld", (long)path.section, (long)path.item];
+            if (![gAutoVisitedIndexPaths containsObject:key]) { chosen = path; break; }
+        }
+        if (!chosen) {
+            if (gAutoScrollAttempts >= 8) { PDDAutoPause(@"目前可見商品已處理，但向下翻頁 8 次仍未找到新商品；請確認列表是否載入更多商品。"); return; }
+            gAutoScrollAttempts++;
+            CGPoint offset = collection.contentOffset;
+            CGFloat nextY = MIN(MAX(0, collection.contentSize.height - collection.bounds.size.height), offset.y + collection.bounds.size.height * 0.72);
+            if (nextY <= offset.y + 2) { PDDAutoPause(@"搜尋結果已到列表底部，沒有更多可採集商品。"); return; }
+            [collection setContentOffset:CGPointMake(offset.x, nextY) animated:YES];
+            PDDAutoScheduleTick(1.0); return;
+        }
+        NSString *key = [NSString stringWithFormat:@"%ld-%ld", (long)chosen.section, (long)chosen.item];
+        [gAutoVisitedIndexPaths addObject:key];
+        id delegate = collection.delegate; SEL selector = NSSelectorFromString(@"collectionView:didSelectItemAtIndexPath:");
+        if (!delegate || ![delegate respondsToSelector:selector]) { PDDAutoPause(@"商品列表點擊回呼不可用。"); return; }
+        gAutoExpectedGoodsID = nil; gAutoPhaseTicks = 0; gAutoCollectState = 7;
+        NSLog(@"[PDDReplica] 1.2.4 opening product indexPath=%@", chosen);
+        @try { ((void (*)(id, SEL, UICollectionView *, NSIndexPath *))objc_msgSend)(delegate, selector, collection, chosen); }
+        @catch (NSException *exception) { PDDAutoPause([NSString stringWithFormat:@"商品點擊回呼例外：%@", exception.reason ?: @"unknown"]); return; }
+        PDDAutoScheduleTick(0.8); return;
+    }
+
+    if (gAutoCollectState == 7) { // wait for this exact selection to navigate before selecting anything else
+        if (isDetail) {
+            gAutoCollectState = 3; gAutoPhaseTicks = 0;
+            if (gAutoExpectedGoodsID.length) { PDDAutoUploadConfirmed(gAutoExpectedGoodsID); return; }
+            PDDAutoScheduleTick(0.8); return;
+        }
+        if (++gAutoPhaseTicks > 35) { PDDAutoPause(@"已觸發商品選取，但 35 秒內未確認進入商品詳情頁。"); return; }
+        PDDAutoScheduleTick(0.8); return;
+    }
+
+    if (gAutoCollectState == 3) { // detail page is visible; wait for its raw JSON upload acceptance
+        if (!isDetail) { if (++gAutoPhaseTicks > 30) { PDDAutoPause(@"商品詳情頁未能穩定顯示。"); return; } PDDAutoScheduleTick(0.8); return; }
+        if (gAutoExpectedGoodsID.length) { PDDAutoUploadConfirmed(gAutoExpectedGoodsID); return; }
+        if (++gAutoPhaseTicks > 90) { PDDAutoPause(@"商品詳情頁已打開，但 90 秒內本地伺服器未確認 TXT 上傳。TXT 若已保存仍會保留在手機；請檢查網路與服務設定。"); return; }
+        PDDAutoScheduleTick(1.0); return;
+    }
+
+    if (gAutoCollectState == 4) { // wait for actual search page after pressing visible back control
+        if (isResults && !isDetail) {
+            gAutoCollectState = 5; gAutoPhaseTicks = 0;
+            PDDAutoScheduleTick(3.0); return;
+        }
+        if (++gAutoPhaseTicks > 30) { PDDAutoPause(@"已觸發詳情頁返回，但未能確認回到搜尋結果頁。"); return; }
+        PDDAutoScheduleTick(0.8); return;
+    }
+    if (gAutoCollectState == 5) { // required 3-second spacing between operations
+        gAutoCollectState = 2; gAutoPhaseTicks = 0;
+        PDDAutoScheduleTick(0.2); return;
+    }
+}
+
+static void PDDAutoUploadConfirmed(NSString *goodsID) {
+    if (!goodsID.length || (gAutoCollectState != 7 && gAutoCollectState != 3)) return;
+    if (gAutoExpectedGoodsID.length && ![gAutoExpectedGoodsID isEqualToString:goodsID]) return;
+    gAutoExpectedGoodsID = [goodsID copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gAutoCollectState != 7 && gAutoCollectState != 3) return;
+        UIWindow *window = PDDActiveWindow();
+        if (!window || !PDDViewTreeContainsClass(window, @"PDDGoodsDetailContentView")) return; // detail view may still be animating in
+
+        UIButton *back = PDDFindDetailBackButton(window);
+        if (!back) { PDDAutoPause(@"已上傳商品資料，但找不到詳情頁底部容器中的「返回」按鈕。"); return; }
+        NSLog(@"[PDDReplica] upload confirmed goods_id=%@; trigger visible back button", goodsID);
+        gAutoCollectState = 4; gAutoPhaseTicks = 0;
+        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+        PDDAutoScheduleTick(0.8);
+    });
+}
+
+static void PDDStartAutoCollectCurrentResults(void) {
+    NSDictionary *active = PDDActiveTaskSnapshot();
+    if (!active || ![active[@"task_id"] isKindOfClass:NSString.class]) {
+        PDDShowMessage(@"尚無採集任務", @"請先在 Windows 管理頁建立任務，並等待 iPhone 領取。");
+        return;
+    }
+    if (!PDDCaptureEnabled()) {
+        PDDShowMessage(@"JSON 擷取目前已暫停", @"請先啟用 JSON 擷取，再開始自動採集。");
+        return;
+    }
+    gAutoSearchTaskID = [active[@"task_id"] copy];
+    gAutoCollectState = 1;
+    gAutoExpectedGoodsID = nil;
+    gAutoScrollAttempts = 0;
+    gAutoPhaseTicks = 0;
+    gAutoVisitedIndexPaths = [NSMutableSet set];
+    PDDShowMessage(@"開始辨識目前搜尋結果", @"請確認拼多多目前已顯示該任務關鍵詞的搜尋結果。插件會先確認商品列表，再逐件採集。");
+    PDDAutoScheduleTick(0.5);
+}
+
 static void PDDTestOpenFirstVisibleProduct(void) {
     void (^runTest)(void) = ^{
         UIWindow *window = PDDActiveWindow();
@@ -865,6 +1081,7 @@ static void PDDShowControlMenu(UIButton *button) {
         [menu addAction:[UIAlertAction actionWithTitle:captureState style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDToggle(button); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"設定本地服務" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDConfigureCloud(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"匯出 TXT ZIP" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDShareTXTFiles(); }]];
+        [menu addAction:[UIAlertAction actionWithTitle:@"開始自動採集目前搜尋結果" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDStartAutoCollectCurrentResults(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"測試打開第一個商品（單次）" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDTestOpenFirstVisibleProduct(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"複製目前介面診斷" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDCopyInterfaceDiagnostics(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
@@ -948,6 +1165,7 @@ static void PDDInstallFloatingButton(void) {
         gEnabled = [NSUserDefaults.standardUserDefaults objectForKey:kEnabledDefaultsKey] ? [NSUserDefaults.standardUserDefaults boolForKey:kEnabledDefaultsKey] : YES;
         gCaptureQueue = dispatch_queue_create("com.local.pddreplica.capture", DISPATCH_QUEUE_SERIAL);
         gUploadingPaths = [NSMutableSet set];
+        gAutoVisitedIndexPaths = [NSMutableSet set];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             PDDInstallFloatingButton();
             PDDStartCloudWorker();
