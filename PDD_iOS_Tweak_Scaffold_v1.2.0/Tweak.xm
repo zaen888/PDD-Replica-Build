@@ -681,32 +681,100 @@ static void PDDConfigureCloud(void) {
     });
 }
 
-static void PDDAppendViewDiagnostics(UIView *view, NSMutableString *out, NSUInteger depth, NSUInteger *count) {
-    if (!view || depth > 18 || *count >= 180 || view.hidden || view.alpha < 0.05) return;
-    (*count)++;
-    NSString *className = NSStringFromClass(view.class);
-    NSString *label = view.accessibilityLabel ?: @"";
-    NSString *identifier = view.accessibilityIdentifier ?: @"";
-    NSString *value = [view isKindOfClass:UITextField.class] ? (((UITextField *)view).text ?: @"") : @"";
-    NSString *title = [view isKindOfClass:UIButton.class] ? ([((UIButton *)view) titleForState:UIControlStateNormal] ?: @"") : @"";
-    CGRect frame = [view convertRect:view.bounds toView:PDDActiveWindow()];
-    if (label.length || identifier.length || value.length || title.length || [view isKindOfClass:UIControl.class]) {
-        [out appendFormat:@"%@%@ frame=(%.0f,%.0f,%.0f,%.0f) label=%@ id=%@ title=%@ value=%@\n",
-         [@"                  " substringToIndex:MIN(depth * 2, (NSUInteger)18)], className,
-         frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-         label, identifier, title, value];
+// MARK: - Targeted UI diagnostics (1.2.1 diagnostic build)
+// Read-only: this code never sends taps or changes the Pinduoduo UI.
+static NSString *PDDDiagString(UIView *view) {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    NSString *label = [view.accessibilityLabel isKindOfClass:NSString.class] ? view.accessibilityLabel : @"";
+    NSString *identifier = [view.accessibilityIdentifier isKindOfClass:NSString.class] ? view.accessibilityIdentifier : @"";
+    NSString *title = @"";
+    if ([view isKindOfClass:UIButton.class]) title = [((UIButton *)view) titleForState:UIControlStateNormal] ?: @"";
+    if (label.length) [parts addObject:[NSString stringWithFormat:@"label=%@", label]];
+    if (identifier.length) [parts addObject:[NSString stringWithFormat:@"id=%@", identifier]];
+    if (title.length) [parts addObject:[NSString stringWithFormat:@"title=%@", title]];
+    if ([view isKindOfClass:UIControl.class]) {
+        UIControl *control = (UIControl *)view;
+        [parts addObject:[NSString stringWithFormat:@"control enabled=%@ selected=%@", control.enabled ? @"YES" : @"NO", control.selected ? @"YES" : @"NO"]];
     }
-    for (UIView *child in view.subviews) PDDAppendViewDiagnostics(child, out, depth + 1, count);
+    if (view.gestureRecognizers.count) {
+        NSMutableArray *gestures = [NSMutableArray array];
+        for (UIGestureRecognizer *gesture in view.gestureRecognizers) [gestures addObject:NSStringFromClass(gesture.class)];
+        [parts addObject:[NSString stringWithFormat:@"gestures=%@", [gestures componentsJoinedByString:@","]]];
+    }
+    return parts.count ? [parts componentsJoinedByString:@" "] : @"-";
+}
+
+static void PDDDiagCollect(UIView *view, NSUInteger depth, NSMutableArray<UIView *> *allViews, NSMutableArray<UIView *> *titleViews) {
+    // Keep the original modest scan budget; no full-page/deep-tree dump.
+    if (!view || depth > 18 || allViews.count >= 180 || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return;
+    [allViews addObject:view];
+    NSString *text = view.accessibilityLabel ?: @"";
+    if ([view isKindOfClass:UIButton.class]) text = [((UIButton *)view) titleForState:UIControlStateNormal] ?: text;
+    BOOL plausibleTextView = [view isKindOfClass:UILabel.class] || [view isKindOfClass:UIImageView.class] || [NSStringFromClass(view.class) containsString:@"YYLabel"];
+    if (plausibleTextView && text.length >= 8 && !PDDStringLooksLikeSearch(text)) [titleViews addObject:view];
+    for (UIView *child in view.subviews) PDDDiagCollect(child, depth + 1, allViews, titleViews);
+}
+
+static void PDDDiagAppendNode(UIView *view, UIWindow *window, NSMutableString *out, NSUInteger indent) {
+    CGRect frame = [view convertRect:view.bounds toView:window];
+    [out appendFormat:@"%@%@ frame=(%.0f,%.0f,%.0f,%.0f) %@\n",
+     [@"                    " substringToIndex:MIN(indent * 2, (NSUInteger)20)],
+     NSStringFromClass(view.class), frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, PDDDiagString(view)];
 }
 
 static void PDDCopyInterfaceDiagnostics(void) {
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDShowMessage(@"介面診斷", @"目前找不到活動視窗。請回到拼多多前景後再試。"); return; }
-    NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell UI diagnostics\n"];
-    NSUInteger count = 0;
-    PDDAppendViewDiagnostics(window, report, 0, &count);
+    NSMutableArray<UIView *> *allViews = [NSMutableArray array];
+    NSMutableArray<UIView *> *titleViews = [NSMutableArray array];
+    PDDDiagCollect(window, 0, allViews, titleViews);
+    NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell UI diagnostics 1.2.1\nREAD_ONLY=YES\n"];
+    [report appendFormat:@"VIEW_COUNT=%lu TITLE_CANDIDATES=%lu SCAN_DEPTH_LIMIT=18\n", (unsigned long)allViews.count, (unsigned long)titleViews.count];
+
+    // Only report controls near likely product titles, rather than every control on screen.
+    [report appendString:@"\n=== PRODUCT CARD CONTEXT (up to 5 ancestors) ===\n"];
+    NSMutableSet<NSString *> *seenTitles = [NSMutableSet set];
+    NSUInteger candidateCount = 0;
+    for (UIView *candidate in titleViews) {
+        NSString *title = candidate.accessibilityLabel ?: @"";
+        if ([candidate isKindOfClass:UIButton.class]) title = [((UIButton *)candidate) titleForState:UIControlStateNormal] ?: title;
+        if (title.length < 8 || [seenTitles containsObject:title]) continue;
+        [seenTitles addObject:title];
+        [report appendFormat:@"\n[CANDIDATE %lu] %@\n", (unsigned long)++candidateCount, title];
+        NSMutableArray<UIView *> *chain = [NSMutableArray array];
+        UIView *node = candidate;
+        for (NSUInteger level = 0; node && level < 6; level++, node = node.superview) [chain addObject:node];
+        for (NSInteger i = (NSInteger)chain.count - 1; i >= 0; i--) PDDDiagAppendNode(chain[(NSUInteger)i], window, report, (NSUInteger)(chain.count - 1 - i));
+        UIView *cardRoot = chain.lastObject ?: candidate;
+        NSMutableArray<UIView *> *nearbyControls = [NSMutableArray array];
+        NSMutableArray<UIView *> *pending = [NSMutableArray arrayWithObject:cardRoot];
+        while (pending.count && nearbyControls.count < 12) {
+            UIView *current = pending.lastObject; [pending removeLastObject];
+            if (current != candidate && ([current isKindOfClass:UIControl.class] || current.gestureRecognizers.count)) [nearbyControls addObject:current];
+            for (UIView *child in current.subviews) [pending addObject:child];
+        }
+        if (nearbyControls.count) {
+            [report appendString:@"  nearby interactive controls:\n"];
+            for (UIView *control in nearbyControls) PDDDiagAppendNode(control, window, report, 3);
+        }
+        if (candidateCount >= 12) { [report appendString:@"... candidate output capped at 12\n"]; break; }
+    }
+
+    [report appendString:@"\n=== DETAIL PAGE RETURN CONTROL ===\n"];
+    BOOL hasGoodsDetailCell = NO, hasReturnButton = NO;
+    for (UIView *view in allViews) {
+        NSString *cls = NSStringFromClass(view.class);
+        NSString *label = view.accessibilityLabel ?: @"";
+        NSString *buttonTitle = [view isKindOfClass:UIButton.class] ? ([((UIButton *)view) titleForState:UIControlStateNormal] ?: @"") : @"";
+        if ([cls containsString:@"GoodsDetail"] || [cls containsString:@"SkuSpecItem"]) hasGoodsDetailCell = YES;
+        if ([label containsString:@"返回"] || [buttonTitle containsString:@"返回"] || [label.lowercaseString containsString:@"back"]) {
+            hasReturnButton = YES;
+            PDDDiagAppendNode(view, window, report, 0);
+        }
+    }
+    [report appendFormat:@"DETAIL_CLASS=%@ RETURN_CONTROL=%@\n", hasGoodsDetailCell ? @"YES" : @"NO", hasReturnButton ? @"YES" : @"NO"];
     UIPasteboard.generalPasteboard.string = report;
-    PDDShowMessage(@"介面診斷已複製", [NSString stringWithFormat:@"已複製目前畫面的控件資訊（掃描 %@ 個視圖）。請貼回給我，用來精確識別搜尋結果商品卡片及商品頁返回控制。", @(count)]);
+    PDDShowMessage(@"介面診斷已複製", [NSString stringWithFormat:@"已檢查 %@ 個視圖。報告只包含商品標題附近的父級與互動控件，以及詳情頁返回控件；不會點擊商品。", @(allViews.count)]);
 }
 
 static void PDDShowControlMenu(UIButton *button) {
