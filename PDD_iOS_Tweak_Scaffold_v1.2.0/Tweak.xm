@@ -53,6 +53,7 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword);
 static void PDDAutoCollectTick(void);
 static void PDDAutoScheduleTick(NSTimeInterval delay);
 static void PDDAutoUploadConfirmed(NSString *goodsID);
+static void PDDAutoPause(NSString *reason);
 
 static BOOL PDDCaptureEnabled(void) {
     @synchronized ([UIApplication class]) { return gEnabled; }
