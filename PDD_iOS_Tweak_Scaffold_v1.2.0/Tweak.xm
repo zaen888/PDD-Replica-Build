@@ -315,7 +315,9 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     if ([view isKindOfClass:UITextField.class]) {
         UITextField *field = (UITextField *)view;
         BOOL identified = PDDStringLooksLikeSearch(field.placeholder) || PDDStringLooksLikeSearch(field.accessibilityLabel) || PDDStringLooksLikeSearch(field.accessibilityIdentifier);
-        if (identified && ![fields containsObject:field]) [fields addObject:field];
+        // Search pages in this app version may expose an editable field without
+        // any searchable accessibility text. Keep it as a fallback candidate.
+        if ((identified || field.enabled) && ![fields containsObject:field]) [fields addObject:field];
     }
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
@@ -413,7 +415,11 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     NSMutableArray<UITextField *> *fields = [NSMutableArray array];
     NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
     PDDCollectSearchControls(window, fields, buttons);
-    UITextField *target = fields.firstObject;
+    UITextField *target = nil;
+    for (UITextField *candidate in fields) {
+        if (PDDStringLooksLikeSearch(candidate.placeholder) || PDDStringLooksLikeSearch(candidate.accessibilityLabel) || PDDStringLooksLikeSearch(candidate.accessibilityIdentifier)) { target = candidate; break; }
+    }
+    if (!target && fields.count == 1) target = fields.firstObject;
     if (!target) {
         UIView *entry = PDDFindSearchEntry(window);
         if (entry && gAutoSearchAttempts < 45) {
@@ -436,20 +442,27 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         return;
     }
 
+    [target becomeFirstResponder];
+    UIPasteboard.generalPasteboard.string = keyword;
     target.text = keyword;
     [target sendActionsForControlEvents:UIControlEventEditingChanged];
-    [target becomeFirstResponder];
-    UIButton *submit = buttons.firstObject;
-    if (submit && submit.enabled) {
-        [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
-    } else {
-        [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
-    }
-    gAutoSearchSubmitted = YES;
-    gAutoCollectState = 1;
-    gAutoPhaseTicks = 0;
-    NSLog(@"[PDDReplica] auto search submitted task=%@ keyword=%@", taskID, keyword);
-    PDDAutoScheduleTick(1.0);
+    [target sendActionsForControlEvents:UIControlEventValueChanged];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // Do not submit if the field disappeared or the task changed while editing.
+        NSDictionary *latest = PDDActiveTaskSnapshot();
+        if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
+        if (![target.text isEqualToString:keyword]) target.text = keyword;
+        [target sendActionsForControlEvents:UIControlEventEditingChanged];
+        UIButton *submit = buttons.firstObject;
+        if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+        else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+        gAutoSearchSubmitted = YES;
+        gAutoCollectState = 1;
+        gAutoPhaseTicks = 0;
+        NSLog(@"[PDDReplica] auto search submitted task=%@ keyword=%@", taskID, keyword);
+        PDDAutoScheduleTick(1.0);
+    });
+    return;
 }
 
 static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
@@ -490,8 +503,11 @@ static BOOL PDDSetActiveTask(NSDictionary *task, BOOL notify) {
             [button setTitle:title forState:UIControlStateNormal];
         }
         if (notify && isNew) {
+            // Do not present a modal alert here: it blocks touches and can cover
+            // the PDDSearchBarInputField while the automation is trying to open it.
             PDDStartAutoSearchForTask(taskID, keyword);
-            PDDShowMessage(@"收到本地採集任務（1.2.4）", [NSString stringWithFormat:@"關鍵詞：%@\n目標商品：%lu（最多 3 件）\n將依序搜尋、打開商品、等待伺服器確認上傳，再返回採集下一件。", keyword, (unsigned long)MIN(MAX(gActiveTargetCount, 1), 3)]);
+            NSLog(@"[PDDReplica] received task %@ keyword=%@ target=%lu; automation started without modal alert",
+                  taskID, keyword, (unsigned long)MIN(MAX(gActiveTargetCount, 1), 3));
         }
     });
     return isNew;
@@ -987,7 +1003,19 @@ static BOOL PDDTryReturnFromDetail(UIWindow *window) {
     if (back) {
         NSLog(@"[PDDReplica] returning from detail using diagnosed back control %@",
               NSStringFromClass(top.class));
-        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+        BOOL invoked = NO;
+        for (id target in back.allTargets) {
+            NSArray<NSString *> *actions = [back actionsForTarget:target forControlEvent:UIControlEventTouchUpInside] ?: @[];
+            for (NSString *actionName in actions) {
+                SEL action = NSSelectorFromString(actionName);
+                if (![actionName isEqualToString:@"backButtonPressed:"] || ![target respondsToSelector:action]) continue;
+                @try { ((void (*)(id, SEL, id))objc_msgSend)(target, action, back); invoked = YES; }
+                @catch (NSException *exception) { NSLog(@"[PDDReplica] direct back action exception: %@", exception.reason); }
+                break;
+            }
+            if (invoked) break;
+        }
+        if (!invoked) [back sendActionsForControlEvents:UIControlEventTouchUpInside];
         return YES;
     }
     if (top.presentingViewController) {
