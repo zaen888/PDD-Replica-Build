@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <zlib.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 static NSString * const kDataFolderName = @"PDDGoodsData";
 static const NSInteger kFloatingButtonTag = 0x50444452;
@@ -773,6 +774,75 @@ static void PDDAppendClickPathDiagnostics(UIView *view, NSMutableString *out, NS
     for (UIView *child in view.subviews) PDDAppendClickPathDiagnostics(child, out, depth + 1, count);
 }
 
+static BOOL PDDFindTestCollection(UIView *view, UICollectionView **collectionOut, NSIndexPath **indexPathOut, NSString **reasonOut) {
+    if (!view) return NO;
+    if ([view isKindOfClass:UICollectionView.class]) {
+        UICollectionView *cv = (UICollectionView *)view;
+        id delegate = cv.delegate;
+        NSString *delegateName = delegate ? NSStringFromClass([delegate class]) : @"nil";
+        SEL selector = NSSelectorFromString(@"collectionView:didSelectItemAtIndexPath:");
+        if ([delegateName containsString:@"PDDSearchResultPageContainerModule"] &&
+            [delegate respondsToSelector:selector]) {
+            NSArray<NSIndexPath *> *paths = [cv.indexPathsForVisibleItems sortedArrayUsingComparator:^NSComparisonResult(NSIndexPath *a, NSIndexPath *b) {
+                if (a.section < b.section) return NSOrderedAscending;
+                if (a.section > b.section) return NSOrderedDescending;
+                if (a.item < b.item) return NSOrderedAscending;
+                if (a.item > b.item) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+            for (NSIndexPath *path in paths) {
+                UICollectionViewCell *cell = [cv cellForItemAtIndexPath:path];
+                NSString *cellName = cell ? NSStringFromClass(cell.class) : @"nil";
+                if (cell && [cellName containsString:@"PDDSRDoubleColNormalGoodsCell"] && !cell.hidden && cell.alpha > 0.05) {
+                    if (collectionOut) *collectionOut = cv;
+                    if (indexPathOut) *indexPathOut = path;
+                    if (reasonOut) *reasonOut = [NSString stringWithFormat:@"delegate=%@ cell=%@ indexPath=%@", delegateName, cellName, path];
+                    return YES;
+                }
+            }
+            if (reasonOut) *reasonOut = [NSString stringWithFormat:@"已找到列表 %@，但沒有可用的可見商品卡片。", delegateName];
+        }
+    }
+    for (UIView *child in view.subviews) {
+        if (PDDFindTestCollection(child, collectionOut, indexPathOut, reasonOut)) return YES;
+    }
+    return NO;
+}
+
+static void PDDTestOpenFirstVisibleProduct(void) {
+    void (^runTest)(void) = ^{
+        UIWindow *window = PDDActiveWindow();
+        if (!window) {
+            PDDShowMessage(@"商品點擊測試", @"找不到活動視窗。請先回到拼多多搜尋結果頁。");
+            return;
+        }
+        UICollectionView *collection = nil;
+        NSIndexPath *indexPath = nil;
+        NSString *reason = nil;
+        if (!PDDFindTestCollection(window, &collection, &indexPath, &reason)) {
+            PDDShowMessage(@"商品點擊測試未執行", reason ?: @"找不到符合條件的搜尋商品列表。請確認目前停留在搜尋結果頁。");
+            return;
+        }
+        id delegate = collection.delegate;
+        SEL selector = NSSelectorFromString(@"collectionView:didSelectItemAtIndexPath:");
+        NSString *detail = [NSString stringWithFormat:@"READ_ONLY_CHECK=PASSED\nTEST_ACTION=delegate callback\n%@", reason ?: @""];
+        UIPasteboard.generalPasteboard.string = detail;
+        NSLog(@"[PDDReplica] 1.2.3 test invoking product selection callback: %@", detail);
+        @try {
+            ((void (*)(id, SEL, UICollectionView *, NSIndexPath *))objc_msgSend)(delegate, selector, collection, indexPath);
+        } @catch (NSException *exception) {
+            PDDShowMessage(@"商品點擊回呼發生例外", exception.reason ?: @"未知錯誤");
+        }
+    };
+    if (NSThread.isMainThread) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), runTest);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), runTest);
+        });
+    }
+}
+
 static void PDDCopyInterfaceDiagnostics(void) {
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDShowMessage(@"介面診斷", @"目前找不到活動視窗。請回到拼多多前景後再試。"); return; }
@@ -795,6 +865,7 @@ static void PDDShowControlMenu(UIButton *button) {
         [menu addAction:[UIAlertAction actionWithTitle:captureState style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDToggle(button); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"設定本地服務" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDConfigureCloud(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"匯出 TXT ZIP" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDShareTXTFiles(); }]];
+        [menu addAction:[UIAlertAction actionWithTitle:@"測試打開第一個商品（單次）" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDTestOpenFirstVisibleProduct(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"複製目前介面診斷" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDCopyInterfaceDiagnostics(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         if (menu.popoverPresentationController) {
