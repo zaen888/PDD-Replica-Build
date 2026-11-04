@@ -323,6 +323,36 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons);
 }
 
+static UIView *PDDFindSearchEntry(UIView *view) {
+    if (!view || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return nil;
+    if ([view isKindOfClass:UIControl.class]) {
+        NSString *title = [view isKindOfClass:UIButton.class] ? [(UIButton *)view titleForState:UIControlStateNormal] : @"";
+        NSString *label = view.accessibilityLabel ?: @"";
+        NSString *identifier = view.accessibilityIdentifier ?: @"";
+        if (PDDStringLooksLikeSearch(title) || PDDStringLooksLikeSearch(label) || PDDStringLooksLikeSearch(identifier)) return view;
+    }
+    NSString *label = view.accessibilityLabel ?: @"";
+    NSString *identifier = view.accessibilityIdentifier ?: @"";
+    if ((PDDStringLooksLikeSearch(label) || PDDStringLooksLikeSearch(identifier)) &&
+        (view.isUserInteractionEnabled || view.gestureRecognizers.count > 0)) return view;
+    for (UIView *child in view.subviews) {
+        UIView *found = PDDFindSearchEntry(child);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void PDDActivateSearchEntry(UIView *entry) {
+    if (!entry) return;
+    if ([entry isKindOfClass:UIControl.class]) {
+        [(UIControl *)entry sendActionsForControlEvents:UIControlEventTouchUpInside];
+        return;
+    }
+    if ([entry respondsToSelector:@selector(accessibilityActivate)]) {
+        ((BOOL (*)(id, SEL))objc_msgSend)(entry, @selector(accessibilityActivate));
+    }
+}
+
 static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     if (!PDDCaptureEnabled() || !taskID.length || !keyword.length) return;
     NSDictionary *active = PDDActiveTaskSnapshot();
@@ -330,46 +360,55 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     if (gAutoSearchSubmitted && [gAutoSearchTaskID isEqualToString:taskID]) return;
 
     UIWindow *window = PDDActiveWindow();
-    NSMutableArray<UITextField *> *fields = [NSMutableArray array];
-    NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
-    if (window) PDDCollectSearchControls(window, fields, buttons);
-
-    UITextField *target = fields.firstObject;
-    if (target) {
-        target.text = keyword;
-        [target sendActionsForControlEvents:UIControlEventEditingChanged];
-        [target becomeFirstResponder];
-        UIButton *submit = buttons.firstObject;
-        if (submit && submit.enabled) {
-            [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
-            gAutoSearchSubmitted = YES;
-            gAutoCollectState = 1;
-            gAutoPhaseTicks = 0;
-            NSLog(@"[PDDReplica] auto search submitted via identified button task=%@", taskID);
-            PDDAutoScheduleTick(1.0);
-            return;
+    if (!window) {
+        if (++gAutoSearchAttempts <= 45) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                PDDAutoSearchAttempt(taskID, keyword);
+            });
         }
-        // If no positively identified search button exists, use the text field's standard return action.
-        [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
-        gAutoSearchSubmitted = YES;
-        gAutoCollectState = 1;
-        gAutoPhaseTicks = 0;
-        NSLog(@"[PDDReplica] emitted standard text-field return event task=%@", taskID);
-        NSLog(@"[PDDReplica] search keyword filled; submit control not safely identified task=%@", taskID);
-        PDDAutoScheduleTick(1.0);
         return;
     }
 
-    gAutoSearchAttempts++;
-    if (gAutoSearchAttempts <= 8) {
-        NSLog(@"[PDDReplica] search field not identified; attempt=%lu task=%@", (unsigned long)gAutoSearchAttempts, taskID);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            PDDAutoSearchAttempt(taskID, keyword);
-        });
-    } else {
+    NSMutableArray<UITextField *> *fields = [NSMutableArray array];
+    NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
+    PDDCollectSearchControls(window, fields, buttons);
+    UITextField *target = fields.firstObject;
+    if (!target) {
+        UIView *entry = PDDFindSearchEntry(window);
+        if (entry && gAutoSearchAttempts < 45) {
+            gAutoSearchAttempts++;
+            NSLog(@"[PDDReplica] opening search entry class=%@ label=%@", NSStringFromClass(entry.class), entry.accessibilityLabel ?: @"");
+            PDDActivateSearchEntry(entry);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                PDDAutoSearchAttempt(taskID, keyword);
+            });
+            return;
+        }
+        if (++gAutoSearchAttempts <= 45) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                PDDAutoSearchAttempt(taskID, keyword);
+            });
+            return;
+        }
         UIPasteboard.generalPasteboard.string = keyword;
-        PDDShowMessage(@"自動搜尋未能識別輸入框", [NSString stringWithFormat:@"關鍵詞已複製：%@\n請手動點擊拼多多搜尋框並貼上。這次不會盲目點擊其他控件。", keyword]);
+        PDDShowMessage(@"無法自動進入搜尋頁", [NSString stringWithFormat:@"已嘗試辨識首頁搜尋入口，但未找到可安全操作的控制項。關鍵詞已複製：%@。請手動進入搜尋頁後重新開始任務。", keyword]);
+        return;
     }
+
+    target.text = keyword;
+    [target sendActionsForControlEvents:UIControlEventEditingChanged];
+    [target becomeFirstResponder];
+    UIButton *submit = buttons.firstObject;
+    if (submit && submit.enabled) {
+        [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+    } else {
+        [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+    }
+    gAutoSearchSubmitted = YES;
+    gAutoCollectState = 1;
+    gAutoPhaseTicks = 0;
+    NSLog(@"[PDDReplica] auto search submitted task=%@ keyword=%@", taskID, keyword);
+    PDDAutoScheduleTick(1.0);
 }
 
 static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
@@ -849,26 +888,54 @@ static BOOL PDDViewTreeContainsClass(UIView *view, NSString *needle) {
 
 static UIButton *PDDFindDetailBackButton(UIView *view) {
     if (!view || view.hidden || view.alpha < 0.05) return nil;
-    BOOL inKnownBackContainer = [NSStringFromClass(view.class) containsString:@"PDDGoodsDetailBottomButtonView"];
-    if (inKnownBackContainer) {
-        NSMutableArray *stack = [NSMutableArray arrayWithObject:view];
-        while (stack.count) {
-            UIView *node = stack.lastObject; [stack removeLastObject];
-            if ([node isKindOfClass:UIButton.class]) {
-                UIButton *button = (UIButton *)node;
-                NSString *title = [button titleForState:UIControlStateNormal] ?: @"";
-                NSString *label = button.accessibilityLabel ?: @"";
-                NSString *identifier = button.accessibilityIdentifier ?: @"";
-                if (button.enabled && ([title containsString:@"返回"] || [label containsString:@"返回"] || [identifier containsString:@"back"])) return button;
-            }
-            for (UIView *child in node.subviews) [stack addObject:child];
-        }
+    if ([view isKindOfClass:UIButton.class]) {
+        UIButton *button = (UIButton *)view;
+        NSString *title = [button titleForState:UIControlStateNormal] ?: @"";
+        NSString *label = button.accessibilityLabel ?: @"";
+        NSString *identifier = button.accessibilityIdentifier ?: @"";
+        BOOL backLike = [title containsString:@"返回"] || [title containsString:@"返回上一頁"] ||
+                        [label containsString:@"返回"] || [label containsString:@"返回上一頁"] ||
+                        [identifier.lowercaseString containsString:@"back"];
+        if (button.enabled && backLike) return button;
     }
     for (UIView *child in view.subviews) {
         UIButton *found = PDDFindDetailBackButton(child);
         if (found) return found;
     }
     return nil;
+}
+
+static UIViewController *PDDTopViewController(UIViewController *controller) {
+    if (!controller) return nil;
+    if (controller.presentedViewController) return PDDTopViewController(controller.presentedViewController);
+    if ([controller isKindOfClass:UINavigationController.class])
+        return PDDTopViewController(((UINavigationController *)controller).visibleViewController);
+    if ([controller isKindOfClass:UITabBarController.class])
+        return PDDTopViewController(((UITabBarController *)controller).selectedViewController);
+    return controller;
+}
+
+static BOOL PDDTryReturnFromDetail(UIWindow *window) {
+    if (!window) return NO;
+    UIViewController *top = PDDTopViewController(window.rootViewController);
+    UINavigationController *nav = top.navigationController;
+    if (nav && nav.viewControllers.count > 1 && top == nav.topViewController) {
+        NSLog(@"[PDDReplica] returning from detail using navigation stack %@", NSStringFromClass(top.class));
+        [nav popViewControllerAnimated:YES];
+        return YES;
+    }
+    UIButton *back = PDDFindDetailBackButton(window);
+    if (back) {
+        NSLog(@"[PDDReplica] returning from detail using visible back control");
+        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+        return YES;
+    }
+    if (top.presentingViewController) {
+        NSLog(@"[PDDReplica] dismissing modal detail controller %@", NSStringFromClass(top.class));
+        [top dismissViewControllerAnimated:YES completion:nil];
+        return YES;
+    }
+    return NO;
 }
 
 static void PDDAutoScheduleTick(NSTimeInterval delay) {
@@ -994,13 +1061,24 @@ static void PDDAutoUploadConfirmed(NSString *goodsID) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gAutoCollectState != 7 && gAutoCollectState != 3) return;
         UIWindow *window = PDDActiveWindow();
-        if (!window || !PDDViewTreeContainsClass(window, @"PDDGoodsDetailContentView")) return; // detail view may still be animating in
-
-        UIButton *back = PDDFindDetailBackButton(window);
-        if (!back) { PDDAutoPause(@"已上傳商品資料，但找不到詳情頁底部容器中的「返回」按鈕。"); return; }
-        NSLog(@"[PDDReplica] upload confirmed goods_id=%@; trigger visible back button", goodsID);
-        gAutoCollectState = 4; gAutoPhaseTicks = 0;
-        [back sendActionsForControlEvents:UIControlEventTouchUpInside];
+        if (!window || !PDDViewTreeContainsClass(window, @"PDDGoodsDetailContentView")) {
+            PDDAutoScheduleTick(0.8);
+            return;
+        }
+        if (PDDTryReturnFromDetail(window)) {
+            NSLog(@"[PDDReplica] upload confirmed goods_id=%@; return action dispatched", goodsID);
+            gAutoCollectState = 4;
+            gAutoPhaseTicks = 0;
+            PDDAutoScheduleTick(0.8);
+            return;
+        }
+        gAutoCollectState = 3;
+        if (++gAutoPhaseTicks > 30) {
+            PDDAutoPause(@"商品已上傳，但目前詳情頁沒有可用的返回按鈕或導覽堆疊。請複製介面診斷以確認實際頁面結構。");
+            return;
+        }
+        NSLog(@"[PDDReplica] upload confirmed goods_id=%@; return control not ready, retry=%lu",
+              goodsID, (unsigned long)gAutoPhaseTicks);
         PDDAutoScheduleTick(0.8);
     });
 }
