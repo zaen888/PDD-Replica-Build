@@ -328,6 +328,14 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
 
 static UIView *PDDFindSearchEntry(UIView *view) {
     if (!view || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return nil;
+
+    // Pinduoduo iOS 6.92.0 home diagnostic: the actual search entry is
+    // a custom PDDSearchBarInputField UIView with a UITapGestureRecognizer.
+    if ([NSStringFromClass(view.class) isEqualToString:@"PDDSearchBarInputField"] &&
+        view.isUserInteractionEnabled && view.gestureRecognizers.count > 0) {
+        return view;
+    }
+
     if ([view isKindOfClass:UIControl.class]) {
         NSString *title = [view isKindOfClass:UIButton.class] ? [(UIButton *)view titleForState:UIControlStateNormal] : @"";
         NSString *label = view.accessibilityLabel ?: @"";
@@ -352,7 +360,37 @@ static void PDDActivateSearchEntry(UIView *entry) {
         return;
     }
     if ([entry respondsToSelector:@selector(accessibilityActivate)]) {
-        ((BOOL (*)(id, SEL))objc_msgSend)(entry, @selector(accessibilityActivate));
+        BOOL activated = ((BOOL (*)(id, SEL))objc_msgSend)(entry, @selector(accessibilityActivate));
+        if (activated) return;
+    }
+
+    // The diagnosed PDDSearchBarInputField is a custom UIView, not a UIButton.
+    // Invoke only its own PDD tap-gesture target/action; do not synthesize screen taps.
+    for (UIGestureRecognizer *gesture in entry.gestureRecognizers ?: @[]) {
+        if (![gesture isKindOfClass:UITapGestureRecognizer.class] || !gesture.enabled) continue;
+        NSArray *targets = nil;
+        @try { targets = [gesture valueForKey:@"_targets"]; } @catch (__unused NSException *e) {}
+        for (id targetRecord in targets ?: @[]) {
+            id target = nil;
+            SEL action = NULL;
+            @try {
+                target = [targetRecord valueForKey:@"target"];
+                id actionValue = [targetRecord valueForKey:@"action"];
+                if ([actionValue isKindOfClass:NSString.class]) action = NSSelectorFromString(actionValue);
+                else if ([actionValue respondsToSelector:@selector(pointerValue)]) action = (SEL)[actionValue pointerValue];
+            } @catch (__unused NSException *e) {}
+            if (!target || !action || ![target respondsToSelector:action]) continue;
+            NSString *targetClass = NSStringFromClass([target class]);
+            if (![targetClass containsString:@"PDDSearchBarInputField"]) continue;
+            NSMethodSignature *sig = [target methodSignatureForSelector:action];
+            if (sig.numberOfArguments >= 3) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, action, gesture);
+            } else {
+                ((void (*)(id, SEL))objc_msgSend)(target, action);
+            }
+            NSLog(@"[PDDReplica] activated diagnosed search tap action %@ on %@", NSStringFromSelector(action), targetClass);
+            return;
+        }
     }
 }
 
@@ -898,13 +936,21 @@ static UIButton *PDDFindDetailBackButton(UIView *view) {
     if (!view || view.hidden || view.alpha < 0.05) return nil;
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
-        NSString *title = [button titleForState:UIControlStateNormal] ?: @"";
-        NSString *label = button.accessibilityLabel ?: @"";
-        NSString *identifier = button.accessibilityIdentifier ?: @"";
-        BOOL backLike = [title containsString:@"返回"] || [title containsString:@"返回上一頁"] ||
-                        [label containsString:@"返回"] || [label containsString:@"返回上一頁"] ||
-                        [identifier.lowercaseString containsString:@"back"];
-        if (button.enabled && backLike) return button;
+        if (button.enabled) {
+            // Prefer the exact action found in DIAG1:
+            // PDDGoodsDetailViewController backButtonPressed:
+            NSArray<NSString *> *actions = [button actionsForTarget:nil forControlEvent:UIControlEventTouchUpInside];
+            for (NSString *actionName in actions) {
+                if ([actionName isEqualToString:@"backButtonPressed:"]) return button;
+            }
+            NSString *title = [button titleForState:UIControlStateNormal] ?: @"";
+            NSString *label = button.accessibilityLabel ?: @"";
+            NSString *identifier = button.accessibilityIdentifier ?: @"";
+            BOOL backLike = [title containsString:@"返回"] || [title containsString:@"返回上一頁"] ||
+                            [label containsString:@"返回"] || [label containsString:@"返回上一頁"] ||
+                            [identifier.lowercaseString containsString:@"back"];
+            if (backLike) return button;
+        }
     }
     for (UIView *child in view.subviews) {
         UIButton *found = PDDFindDetailBackButton(child);
@@ -932,9 +978,15 @@ static BOOL PDDTryReturnFromDetail(UIWindow *window) {
         [nav popViewControllerAnimated:YES];
         return YES;
     }
-    UIButton *back = PDDFindDetailBackButton(window);
+
+    // DIAG1 found the real control at (20,48,66,44), label=返回,
+    // target=PDDGoodsDetailViewController selector=backButtonPressed:.
+    // Search the active detail controller's own view first, then the window.
+    UIButton *back = PDDFindDetailBackButton(top.view);
+    if (!back) back = PDDFindDetailBackButton(window);
     if (back) {
-        NSLog(@"[PDDReplica] returning from detail using visible back control");
+        NSLog(@"[PDDReplica] returning from detail using diagnosed back control %@",
+              NSStringFromClass(top.class));
         [back sendActionsForControlEvents:UIControlEventTouchUpInside];
         return YES;
     }
@@ -1155,84 +1207,15 @@ static void PDDTestOpenFirstVisibleProduct(void) {
     }
 }
 
-
-// Expanded read-only diagnostics: enumerate interactive controls across the full
-// visible hierarchy, including unlabeled/custom controls and their action targets.
-static void PDDAppendInteractiveDiagnostics(UIView *view, NSMutableString *out, NSUInteger depth, NSUInteger *count, UIWindow *window) {
-    if (!view || depth > 24 || *count >= 1400 || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return;
-    (*count)++;
-    CGRect frame = [view convertRect:view.bounds toView:window];
-    NSString *cls = NSStringFromClass(view.class);
-    NSString *label = view.accessibilityLabel ?: @"";
-    NSString *ident = view.accessibilityIdentifier ?: @"";
-    BOOL interactive = view.userInteractionEnabled &&
-        ([view isKindOfClass:UIControl.class] || view.gestureRecognizers.count > 0 ||
-         [view isKindOfClass:UITextField.class] || [view isKindOfClass:UITextView.class]);
-    if (interactive) {
-        [out appendFormat:@"INTERACTIVE class=%@ frame=(%.0f,%.0f,%.0f,%.0f) label=%@ identifier=%@ enabled=%@ gestures=%lu\n",
-         cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-         label, ident, ([view isKindOfClass:UIControl.class] && ![(UIControl *)view isEnabled]) ? @"NO" : @"YES",
-         (unsigned long)view.gestureRecognizers.count];
-        if ([view isKindOfClass:UIButton.class]) {
-            UIButton *b=(UIButton *)view;
-            [out appendFormat:@"  BUTTON title=%@ state=%ld\n", [b titleForState:UIControlStateNormal] ?: @"", (long)b.state];
-        }
-        if ([view isKindOfClass:UITextField.class]) {
-            UITextField *f=(UITextField *)view;
-            [out appendFormat:@"  TEXTFIELD placeholder=%@ textLength=%lu delegate=%@\n", f.placeholder ?: @"", (unsigned long)f.text.length, f.delegate ? NSStringFromClass([f.delegate class]) : @"nil"];
-        }
-        if ([view isKindOfClass:UIControl.class]) {
-            UIControl *control=(UIControl *)view;
-            for (id target in control.allTargets) {
-                for (NSUInteger bit=0; bit<26; bit++) {
-                    UIControlEvents event=(UIControlEvents)(1UL<<bit);
-                    if (!(control.allControlEvents & event)) continue;
-                    NSArray *actions=[control actionsForTarget:target forControlEvent:event];
-                    for (NSString *action in actions) {
-                        [out appendFormat:@"  CONTROL_ACTION target=%@ selector=%@ event=0x%lx\n",
-                         NSStringFromClass([target class]), action, (unsigned long)event];
-                    }
-                }
-            }
-        }
-    }
-    for (UIGestureRecognizer *g in view.gestureRecognizers) {
-        [out appendFormat:@"GESTURE owner=%@ frame=(%.0f,%.0f,%.0f,%.0f) class=%@ enabled=%@ targets=%@\n",
-         cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
-         NSStringFromClass(g.class), g.enabled ? @"YES" : @"NO", PDDGestureTargetSummary(g)];
-    }
-    for (UIView *child in view.subviews) PDDAppendInteractiveDiagnostics(child, out, depth+1, count, window);
-}
-
-static void PDDAppendControllerDiagnostics(UIViewController *controller, NSMutableString *out, NSUInteger depth) {
-    if (!controller || depth > 12) return;
-    [out appendFormat:@"VIEW_CONTROLLER depth=%lu class=%@ title=%@ presented=%@ nav=%@\n",
-     (unsigned long)depth, NSStringFromClass(controller.class), controller.title ?: @"",
-     controller.presentedViewController ? NSStringFromClass(controller.presentedViewController.class) : @"nil",
-     controller.navigationController ? [NSString stringWithFormat:@"%@ stack=%lu top=%@", NSStringFromClass(controller.navigationController.class), (unsigned long)controller.navigationController.viewControllers.count, NSStringFromClass(controller.navigationController.topViewController.class)] : @"nil"];
-    if (controller.presentedViewController) PDDAppendControllerDiagnostics(controller.presentedViewController, out, depth+1);
-    if ([controller isKindOfClass:UINavigationController.class]) {
-        for (UIViewController *child in ((UINavigationController *)controller).viewControllers) PDDAppendControllerDiagnostics(child, out, depth+1);
-    } else if ([controller isKindOfClass:UITabBarController.class] && ((UITabBarController *)controller).selectedViewController) {
-        PDDAppendControllerDiagnostics(((UITabBarController *)controller).selectedViewController, out, depth+1);
-    }
-}
-
 static void PDDCopyInterfaceDiagnostics(void) {
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDShowMessage(@"介面診斷", @"目前找不到活動視窗。請回到拼多多前景後再試。"); return; }
-    NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell expanded interface diagnostics 1.2.4-DIAG1\nREAD_ONLY=YES\n"];
-    [report appendString:@"\n-- VIEW CONTROLLER STACK --\n"];
-    PDDAppendControllerDiagnostics(window.rootViewController, report, 0);
-    [report appendString:@"\n-- EXISTING CLICK-PATH SUMMARY --\n"];
-    NSUInteger summaryCount = 0;
-    PDDAppendClickPathDiagnostics(window, report, 0, &summaryCount);
-    [report appendString:@"\n-- ALL INTERACTIVE CONTROLS / ACTIONS --\n"];
-    NSUInteger interactiveCount = 0;
-    PDDAppendInteractiveDiagnostics(window, report, 0, &interactiveCount, window);
-    [report appendFormat:@"\nSUMMARY_VIEW_COUNT=%lu\nINTERACTIVE_VIEW_COUNT=%lu\n", (unsigned long)summaryCount, (unsigned long)interactiveCount];
+    NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell interface diagnostics 1.2.4\nREAD_ONLY=YES\n"];
+    NSUInteger count = 0;
+    PDDAppendClickPathDiagnostics(window, report, 0, &count);
+    [report appendFormat:@"\nVIEW_COUNT=%lu\n", (unsigned long)count];
     UIPasteboard.generalPasteboard.string = report;
-    PDDShowMessage(@"點擊路徑診斷已複製", [NSString stringWithFormat:@"已複製完整唯讀介面資訊（互動視圖 %@ 個）。不會執行任何點擊。", @(interactiveCount)]);
+    PDDShowMessage(@"點擊路徑診斷已複製", [NSString stringWithFormat:@"已複製點擊路徑資訊（掃描 %@ 個視圖）。不會執行任何點擊。", @(count)]);
 }
 
 static void PDDShowControlMenu(UIButton *button) {
