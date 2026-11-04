@@ -38,6 +38,9 @@ static NSString *gAutoExpectedGoodsID = nil;
 static NSUInteger gAutoScrollAttempts = 0;
 static NSUInteger gAutoPhaseTicks = 0;
 static BOOL gAutoTickScheduled = NO;
+// Server may mark the task complete on the last upload before the UI has returned.
+// Defer clearing task state until the detail->results transition is confirmed.
+static BOOL gAutoTaskCompletedPendingReturn = NO;
 
 static NSString *PDDDataDirectory(void);
 static void PDDShowMessage(NSString *title, NSString *message);
@@ -416,6 +419,7 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
     gAutoSearchTaskID = [taskID copy];
     gAutoSearchAttempts = 0;
     gAutoSearchSubmitted = NO;
+    gAutoTaskCompletedPendingReturn = NO;
     gAutoCollectState = 0;
     gAutoExpectedGoodsID = nil;
     gAutoScrollAttempts = 0;
@@ -458,6 +462,7 @@ static BOOL PDDSetActiveTask(NSDictionary *task, BOOL notify) {
 static void PDDClearActiveTask(void) {
     gAutoSearchTaskID = nil; gAutoSearchAttempts = 0; gAutoSearchSubmitted = NO;
     gAutoCollectState = 0; gAutoExpectedGoodsID = nil; gAutoScrollAttempts = 0; gAutoPhaseTicks = 0;
+    gAutoTaskCompletedPendingReturn = NO;
     gAutoVisitedIndexPaths = [NSMutableSet set];
     @synchronized ([UIApplication class]) {
         gActiveTaskID = nil; gActiveKeyword = nil; gActiveTargetCount = 0; gActiveSavedCount = 0;
@@ -545,8 +550,11 @@ static void PDDHandleUploadSuccess(NSDictionary *envelope, NSDictionary *respons
     NSString *uploadedGoodsID = [envelope[@"goods_id"] isKindOfClass:NSString.class] ? envelope[@"goods_id"] : nil;
     if (uploadedGoodsID.length) PDDAutoUploadConfirmed(uploadedGoodsID);
     if (completed) {
-        PDDShowMessage(@"採集任務完成", [NSString stringWithFormat:@"%@\n成功上傳 %lu 件商品。", gActiveKeyword ?: @"", (unsigned long)saved]);
-        PDDClearActiveTask();
+        // Do NOT clear the active task here: PDDAutoUploadConfirmed still needs its
+        // task/state context to return from the detail page. Clearing here used to
+        // cancel the return tick and strand the app on the final product.
+        gAutoTaskCompletedPendingReturn = YES;
+        NSLog(@"[PDDReplica] server marked task complete; defer clearing until search page is confirmed task=%@", taskID);
     } else {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *window = PDDActiveWindow(); UIButton *button = (UIButton *)[window viewWithTag:kFloatingButtonTag];
@@ -1042,6 +1050,16 @@ static void PDDAutoCollectTick(void) {
 
     if (gAutoCollectState == 4) { // wait for actual search page after pressing visible back control
         if (isResults && !isDetail) {
+            // The server's final-upload response can arrive before the UI navigation
+            // finishes. Only now is it safe to release this task and let the next
+            // cloud poll claim another one.
+            if (gAutoTaskCompletedPendingReturn || saved >= target) {
+                NSString *finishedKeyword = [active[@"keyword"] isKindOfClass:NSString.class] ? active[@"keyword"] : @"";
+                NSUInteger finishedCount = saved;
+                PDDShowMessage(@"採集任務完成", [NSString stringWithFormat:@"%@\n成功上傳 %lu 件商品。", finishedKeyword, (unsigned long)finishedCount]);
+                PDDClearActiveTask();
+                return;
+            }
             gAutoCollectState = 5; gAutoPhaseTicks = 0;
             PDDAutoScheduleTick(3.0); return;
         }
@@ -1137,15 +1155,84 @@ static void PDDTestOpenFirstVisibleProduct(void) {
     }
 }
 
+
+// Expanded read-only diagnostics: enumerate interactive controls across the full
+// visible hierarchy, including unlabeled/custom controls and their action targets.
+static void PDDAppendInteractiveDiagnostics(UIView *view, NSMutableString *out, NSUInteger depth, NSUInteger *count, UIWindow *window) {
+    if (!view || depth > 24 || *count >= 1400 || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return;
+    (*count)++;
+    CGRect frame = [view convertRect:view.bounds toView:window];
+    NSString *cls = NSStringFromClass(view.class);
+    NSString *label = view.accessibilityLabel ?: @"";
+    NSString *ident = view.accessibilityIdentifier ?: @"";
+    BOOL interactive = view.userInteractionEnabled &&
+        ([view isKindOfClass:UIControl.class] || view.gestureRecognizers.count > 0 ||
+         [view isKindOfClass:UITextField.class] || [view isKindOfClass:UITextView.class]);
+    if (interactive) {
+        [out appendFormat:@"INTERACTIVE class=%@ frame=(%.0f,%.0f,%.0f,%.0f) label=%@ identifier=%@ enabled=%@ gestures=%lu\n",
+         cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+         label, ident, ([view isKindOfClass:UIControl.class] && ![(UIControl *)view isEnabled]) ? @"NO" : @"YES",
+         (unsigned long)view.gestureRecognizers.count];
+        if ([view isKindOfClass:UIButton.class]) {
+            UIButton *b=(UIButton *)view;
+            [out appendFormat:@"  BUTTON title=%@ state=%ld\n", [b titleForState:UIControlStateNormal] ?: @"", (long)b.state];
+        }
+        if ([view isKindOfClass:UITextField.class]) {
+            UITextField *f=(UITextField *)view;
+            [out appendFormat:@"  TEXTFIELD placeholder=%@ textLength=%lu delegate=%@\n", f.placeholder ?: @"", (unsigned long)f.text.length, f.delegate ? NSStringFromClass([f.delegate class]) : @"nil"];
+        }
+        if ([view isKindOfClass:UIControl.class]) {
+            UIControl *control=(UIControl *)view;
+            for (id target in control.allTargets) {
+                for (NSUInteger bit=0; bit<26; bit++) {
+                    UIControlEvents event=(UIControlEvents)(1UL<<bit);
+                    if (!(control.allControlEvents & event)) continue;
+                    NSArray *actions=[control actionsForTarget:target forControlEvent:event];
+                    for (NSString *action in actions) {
+                        [out appendFormat:@"  CONTROL_ACTION target=%@ selector=%@ event=0x%lx\n",
+                         NSStringFromClass([target class]), action, (unsigned long)event];
+                    }
+                }
+            }
+        }
+    }
+    for (UIGestureRecognizer *g in view.gestureRecognizers) {
+        [out appendFormat:@"GESTURE owner=%@ frame=(%.0f,%.0f,%.0f,%.0f) class=%@ enabled=%@ targets=%@\n",
+         cls, frame.origin.x, frame.origin.y, frame.size.width, frame.size.height,
+         NSStringFromClass(g.class), g.enabled ? @"YES" : @"NO", PDDGestureTargetSummary(g)];
+    }
+    for (UIView *child in view.subviews) PDDAppendInteractiveDiagnostics(child, out, depth+1, count, window);
+}
+
+static void PDDAppendControllerDiagnostics(UIViewController *controller, NSMutableString *out, NSUInteger depth) {
+    if (!controller || depth > 12) return;
+    [out appendFormat:@"VIEW_CONTROLLER depth=%lu class=%@ title=%@ presented=%@ nav=%@\n",
+     (unsigned long)depth, NSStringFromClass(controller.class), controller.title ?: @"",
+     controller.presentedViewController ? NSStringFromClass(controller.presentedViewController.class) : @"nil",
+     controller.navigationController ? [NSString stringWithFormat:@"%@ stack=%lu top=%@", NSStringFromClass(controller.navigationController.class), (unsigned long)controller.navigationController.viewControllers.count, NSStringFromClass(controller.navigationController.topViewController.class)] : @"nil"];
+    if (controller.presentedViewController) PDDAppendControllerDiagnostics(controller.presentedViewController, out, depth+1);
+    if ([controller isKindOfClass:UINavigationController.class]) {
+        for (UIViewController *child in ((UINavigationController *)controller).viewControllers) PDDAppendControllerDiagnostics(child, out, depth+1);
+    } else if ([controller isKindOfClass:UITabBarController.class] && ((UITabBarController *)controller).selectedViewController) {
+        PDDAppendControllerDiagnostics(((UITabBarController *)controller).selectedViewController, out, depth+1);
+    }
+}
+
 static void PDDCopyInterfaceDiagnostics(void) {
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDShowMessage(@"介面診斷", @"目前找不到活動視窗。請回到拼多多前景後再試。"); return; }
-    NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell click-path diagnostics 1.2.2\nREAD_ONLY=YES\n"];
-    NSUInteger count = 0;
-    PDDAppendClickPathDiagnostics(window, report, 0, &count);
-    [report appendFormat:@"\nVIEW_COUNT=%lu\n", (unsigned long)count];
+    NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell expanded interface diagnostics 1.2.4-DIAG1\nREAD_ONLY=YES\n"];
+    [report appendString:@"\n-- VIEW CONTROLLER STACK --\n"];
+    PDDAppendControllerDiagnostics(window.rootViewController, report, 0);
+    [report appendString:@"\n-- EXISTING CLICK-PATH SUMMARY --\n"];
+    NSUInteger summaryCount = 0;
+    PDDAppendClickPathDiagnostics(window, report, 0, &summaryCount);
+    [report appendString:@"\n-- ALL INTERACTIVE CONTROLS / ACTIONS --\n"];
+    NSUInteger interactiveCount = 0;
+    PDDAppendInteractiveDiagnostics(window, report, 0, &interactiveCount, window);
+    [report appendFormat:@"\nSUMMARY_VIEW_COUNT=%lu\nINTERACTIVE_VIEW_COUNT=%lu\n", (unsigned long)summaryCount, (unsigned long)interactiveCount];
     UIPasteboard.generalPasteboard.string = report;
-    PDDShowMessage(@"點擊路徑診斷已複製", [NSString stringWithFormat:@"已複製點擊路徑資訊（掃描 %@ 個視圖）。不會執行任何點擊。", @(count)]);
+    PDDShowMessage(@"點擊路徑診斷已複製", [NSString stringWithFormat:@"已複製完整唯讀介面資訊（互動視圖 %@ 個）。不會執行任何點擊。", @(interactiveCount)]);
 }
 
 static void PDDShowControlMenu(UIButton *button) {
