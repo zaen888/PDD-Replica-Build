@@ -279,6 +279,7 @@ static BOOL PDDStringLooksLikeSearch(NSString *value) {
     return [v containsString:@"搜索"] || [v containsString:@"搜尋"] || [v containsString:@"search"];
 }
 
+// 修改：不再过滤，只要是 UITextField 就先收集起来
 static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *> *fields, NSMutableArray<UIButton *> *buttons) {
     if (!view || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return;
     if ([view isKindOfClass:UISearchBar.class]) {
@@ -290,8 +291,7 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     }
     if ([view isKindOfClass:UITextField.class]) {
         UITextField *field = (UITextField *)view;
-        BOOL identified = PDDStringLooksLikeSearch(field.placeholder) || PDDStringLooksLikeSearch(field.accessibilityLabel) || PDDStringLooksLikeSearch(field.accessibilityIdentifier);
-        if ((identified || field.enabled) && ![fields containsObject:field]) [fields addObject:field];
+        if (![fields containsObject:field]) [fields addObject:field];
     }
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
@@ -302,30 +302,38 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons);
 }
 
-// 增加：主動點擊結果頁頂部的搜尋框
+// 增加：更暴力的模拟点击，直接触发 Gesture 的 target 和 action
 static BOOL PDDTryTapSearchEntry(UIWindow *window) {
     if (!window) return NO;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
     while (stack.count) {
         UIView *view = stack.lastObject; [stack removeLastObject];
         NSString *cls = NSStringFromClass(view.class);
-        // 根據之前的診斷，搜尋框是 PDDSearchBarInputField
         if ([cls containsString:@"PDDSearchBarInputField"]) {
-            // 檢查它是否在螢幕上半部（避免點到其他東西）
             CGRect frame = [view convertRect:view.bounds toView:window];
             if (frame.origin.y < 150) {
                 for (UIGestureRecognizer *g in view.gestureRecognizers) {
                     if ([g isKindOfClass:UITapGestureRecognizer.class]) {
-                        PDDDiagEvent(@"auto.tap_search_entry", @{@"class": cls});
-                        // 手動觸發點擊手勢
-                        if ([g respondsToSelector:@selector(_sendAction)]) {
-                            [g performSelector:@selector(_sendAction)];
-                            return YES;
-                        }
+                        PDDDiagEvent(@"force.tap_entry", @{@"class": cls});
+                        @try {
+                            // 直接通过 KVC 取目标并强制调用
+                            id targets = [g valueForKey:@"_targets"];
+                            if ([targets isKindOfClass:NSArray.class]) {
+                                for (id entry in (NSArray *)targets) {
+                                    id target = [entry valueForKey:@"_target"];
+                                    NSString *actionName = [entry valueForKey:@"_action"];
+                                    if (target && actionName) {
+                                        SEL action = NSSelectorFromString(actionName);
+                                        if ([target respondsToSelector:action]) {
+                                            ((void (*)(id, SEL, id))objc_msgSend)(target, action, g);
+                                            return YES;
+                                        }
+                                    }
+                                }
+                            }
+                        } @catch (__unused NSException *e) {}
                     }
                 }
-                // 如果沒有手勢，嘗試直接讓它成為第一響應者或者模擬觸控
-                [view becomeFirstResponder];
             }
         }
         for (UIView *child in view.subviews) [stack addObject:child];
@@ -352,23 +360,37 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     NSMutableArray<UITextField *> *fields = [NSMutableArray array];
     NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
     PDDCollectSearchControls(window, fields, buttons);
-    UITextField *target = nil;
-    for (UITextField *candidate in fields) {
-        if (PDDStringLooksLikeSearch(candidate.placeholder) || PDDStringLooksLikeSearch(candidate.accessibilityLabel) || PDDStringLooksLikeSearch(candidate.accessibilityIdentifier)) { target = candidate; break; }
-    }
-    if (!target && fields.count == 1) target = fields.firstObject;
     
-    // 如果找不到輸入框，嘗試點擊結果頁頂部的搜尋入口
+    UITextField *target = nil;
+    
+    // 1. 优先找带 search 特征的
+    for (UITextField *candidate in fields) {
+        if (PDDStringLooksLikeSearch(candidate.placeholder) || PDDStringLooksLikeSearch(candidate.accessibilityLabel) || PDDStringLooksLikeSearch(candidate.accessibilityIdentifier)) { 
+            target = candidate; 
+            break; 
+        }
+    }
+    
+    // 2. 如果没有，找屏幕上半部分看起来像输入框的
+    if (!target) {
+        for (UITextField *candidate in fields) {
+            CGRect frame = [candidate convertRect:candidate.bounds toView:window];
+            if (frame.origin.y < 200 && frame.size.width > 50) {
+                target = candidate;
+                break;
+            }
+        }
+    }
+    
+    // 3. 如果死活找不到，说明在结果页，得强行去点搜索框唤醒它
     if (!target) {
         BOOL tapped = PDDTryTapSearchEntry(window);
-        if (tapped) {
-            PDDDiagEvent(@"search.tapped_entry", @{@"task": taskID});
-        } else if (gAutoSearchAttempts == 0) {
-            PDDDiagEvent(@"search.wait_for_manual_input", @{@"task": taskID});
+        if (tapped && gAutoSearchAttempts == 0) {
+            PDDDiagEvent(@"search.force_tapped_entry", @{@"task": taskID});
         }
         
         if (++gAutoSearchAttempts <= 180) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 PDDAutoSearchAttempt(taskID, keyword);
             });
             return;
@@ -377,9 +399,11 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         return;
     }
 
+    // 强制让它获取焦点
     if (![target becomeFirstResponder] && !target.isFirstResponder) {
+        PDDDiagEvent(@"search.force_become_first_responder_failed", @{@"class": NSStringFromClass(target.class)});
         UIPasteboard.generalPasteboard.string = keyword;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             PDDAutoSearchAttempt(taskID, keyword);
         });
         return;
@@ -432,7 +456,8 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
     gAutoPhaseTicks = 0;
     gAutoVisitedIndexPaths = [NSMutableSet set];
     UIPasteboard.generalPasteboard.string = keyword;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // 增加延迟，等待详情页返回结果页后 UI 稳定
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         PDDAutoSearchAttempt(taskID, keyword);
     });
 }
