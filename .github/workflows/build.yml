@@ -1,39 +1,70 @@
-name: Build Theos Tweak
+name: Build PDDReplicaShell
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master, feature/1.2.0-auto-search ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./PDD_iOS_Tweak_Scaffold_v1.2.0
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Setup Theos
-      run: |
-        export THEOS=~/theos
-        git clone --recursive https://github.com/theos/theos.git $THEOS
-        curl -LO https://github.com/theos/sdks/archive/master.zip
-        unzip -q master.zip -d $THEOS/sdks
-        mv $THEOS/sdks/sdks-master/* $THEOS/sdks/
-        rm -rf $THEOS/sdks/sdks-master master.zip
-    - name: Install ldid
-      run: brew install ldid
-    - name: Build package
-      run: |
-        export THEOS=~/theos
-        # 注意这里，我们进入了你的文件夹
-        cd PDD_iOS_Tweak_Scaffold_v0.4
-        make clean package
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev xz-utils unzip curl wget clang lld
 
-    - name: Upload Dylib
-      uses: actions/upload-artifact@v4
-      with:
-        name: PDD-Tweak-Dylib
-        path: |
-          PDD_iOS_Tweak_Scaffold_v0.4/.theos/obj/**/*.dylib
-          PDD_iOS_Tweak_Scaffold_v0.4/.theos/_/Library/MobileSubstrate/DynamicLibraries/*.dylib
-        if-no-files-found: warn
+      - name: Download Dependencies
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/deps
+          cd $GITHUB_WORKSPACE/deps
+          
+          wget -q --tries=5 https://github.com/theos/logos/archive/refs/heads/master.zip -O logos.zip && unzip -q logos.zip
+          wget -q --tries=5 https://github.com/theos/headers/archive/refs/heads/master.zip -O headers.zip && unzip -q headers.zip
+          wget -q --tries=5 https://github.com/theos/sdks/archive/refs/heads/master.zip -O sdks.zip && unzip -q sdks.zip
+          
+          wget -q --tries=5 https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -O ldid
+          chmod +x ldid
+
+      - name: Build Dylib
+        run: |
+          DEPS="$GITHUB_WORKSPACE/deps"
+          SDK_PATH="$DEPS/sdks-master/iPhoneOS15.6.sdk"
+          LOGOS_PL="$DEPS/logos-master/bin/logos.pl"
+          HEADERS="$DEPS/headers-master/include"
+
+          # 1. 用 Logos 預處理器將 .xm 轉換為純 ObjC 代碼 .mm
+          perl $LOGOS_PL Tweak.xm > Tweak.mm
+          perl $LOGOS_PL PDDInputHooks.xm > PDDInputHooks.mm
+
+          # 2. 使用系統的 clang 直接編譯並鏈接，動態查找未定義符號（避免找不到 substrate 庫）
+          clang++ -dynamiclib \
+            -arch arm64 -arch arm64e \
+            -mios-version-min=14.0 \
+            -isysroot "$SDK_PATH" \
+            -F"$SDK_PATH/System/Library/Frameworks" \
+            -F"$SDK_PATH/System/Library/PrivateFrameworks" \
+            -I"$HEADERS" \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -lz -Wl,-undefined,dynamic_lookup \
+            -fobjc-arc -fmodules -fblocks -DTHEOS_PACKAGE_NAME=\"com.local.pddreplicashell\" \
+            PDDDiagnostics.m Tweak.mm PDDInputHooks.mm \
+            -o PDDReplicaShell.dylib
+
+          # 3. 使用 ldid 簽名
+          $DEPS/ldid -S PDDReplicaShell.dylib
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDDReplicaShell-dylib
+          path: PDD_iOS_Tweak_Scaffold_v1.2.0/PDDReplicaShell.dylib
+          if-no-files-found: warn
