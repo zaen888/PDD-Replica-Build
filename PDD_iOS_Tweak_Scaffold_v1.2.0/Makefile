@@ -4,7 +4,7 @@ THEOS_PACKAGE_SCHEME = rootless
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = PDDReplicaShell
-PDDReplicaShell_FILES = Tweak.xm PDDDiagnostics.m
+PDDReplicaShell_FILES = Tweak.xm PDDDiagnostics.m PDDInputHooks.xm
 PDDReplicaShell_CFLAGS = -fobjc-arc
 PDDReplicaShell_FRAMEWORKS = UIKit Foundation
 PDDReplicaShell_LIBRARIES = z
