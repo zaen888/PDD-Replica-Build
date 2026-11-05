@@ -20,12 +20,12 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang lld unzip
+          # 加上了 dpkg-dev 和 dpkg，解決找不到 dpkg-deb 的問題
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang lld unzip dpkg-dev dpkg
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
-          # 使用 --depth 1 加速下載
           git clone --depth 1 https://github.com/theos/theos.git $THEOS
           mkdir -p $THEOS/bin
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
@@ -38,7 +38,6 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           mkdir -p $THEOS/sdks
-          # 直接用 wget 下載 zip，徹底避開 sparse-checkout 或 mv 找不到資料夾的錯誤
           wget -q https://github.com/theos/sdks/archive/refs/heads/master.zip -O /tmp/sdks.zip
           unzip -q /tmp/sdks.zip -d /tmp/
           mv /tmp/sdks-master/* $THEOS/sdks/
@@ -46,7 +45,6 @@ jobs:
       - name: Build
         run: |
           make clean || true
-          # 關鍵：指定使用 lld 連結器，完美解決 ld unrecognised emulation mode 的報錯
           make package TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=lld"
 
       - name: Upload artifacts
