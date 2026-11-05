@@ -18,7 +18,12 @@ jobs:
           submodules: recursive
 
       - name: Setup Theos
-        uses: theos/theos-action@v1
+        uses: Randomblock1/theos-action@v1
+        with:
+          theos-dir: 'theos'
+          theos-src: 'https://github.com/theos/theos'
+          theos-sdks: 'https://github.com/theos/sdks'
+          theos-sdks-branch: 'master'
 
       - name: Build
         run: |
