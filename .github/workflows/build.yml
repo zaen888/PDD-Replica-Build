@@ -20,16 +20,27 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang lld unzip
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang llvm lld libtool
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
-          # 關鍵修復：加上 --recursive 把 dm.pl 等子模組拉下來
+          # 完整拉取 Theos 及其子模組
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          
+          # 安裝 ldid
           mkdir -p $THEOS/bin
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
+          
+          # 建立工具鏈目錄並鏈接系統 LLVM 工具
+          mkdir -p $THEOS/toolchain/linux/iphone/bin
+          ln -sf $(which clang) $THEOS/toolchain/linux/iphone/bin/clang
+          ln -sf $(which clang++) $THEOS/toolchain/linux/iphone/bin/clang++
+          ln -sf $(which ld.lld) $THEOS/toolchain/linux/iphone/bin/ld
+          ln -sf $(which llvm-ar) $THEOS/toolchain/linux/iphone/bin/ar
+          ln -sf $(which llvm-ranlib) $THEOS/toolchain/linux/iphone/bin/ranlib
+          ln -sf $(which llvm-strip) $THEOS/toolchain/linux/iphone/bin/strip
           
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
@@ -45,13 +56,13 @@ jobs:
       - name: Build
         run: |
           make clean || true
-          # 關鍵修復：不跑 make package（不打 deb 包），直接 make 生成 dylib
-          make TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=lld"
+          # 直接編譯 dylib，跳過 deb 打包
+          make TARGET=iphone:clang:latest:14.0
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PDDReplicaShell-dylib
-          # 直接提取編譯好的 dylib
+          # 提取編譯好的 dylib
           path: PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
           if-no-files-found: warn
