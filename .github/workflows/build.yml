@@ -32,6 +32,21 @@ jobs:
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
 
+      - name: Download iOS SDK
+        run: |
+          export THEOS=$HOME/theos
+          mkdir -p $THEOS/sdks
+          
+          # 使用 sparse-checkout 只拉取 15.6 的 SDK，速度極快且不佔空間
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          cd /tmp/sdks
+          git sparse-checkout set iPhoneOS15.6.sdk
+          mv iPhoneOS15.6.sdk $THEOS/sdks/
+          cd $GITHUB_WORKSPACE
+          rm -rf /tmp/sdks
+          
+          ls -la $THEOS/sdks
+
       - name: Build
         run: |
           make clean || true
