@@ -302,6 +302,37 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons);
 }
 
+// 增加：主動點擊結果頁頂部的搜尋框
+static BOOL PDDTryTapSearchEntry(UIWindow *window) {
+    if (!window) return NO;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
+    while (stack.count) {
+        UIView *view = stack.lastObject; [stack removeLastObject];
+        NSString *cls = NSStringFromClass(view.class);
+        // 根據之前的診斷，搜尋框是 PDDSearchBarInputField
+        if ([cls containsString:@"PDDSearchBarInputField"]) {
+            // 檢查它是否在螢幕上半部（避免點到其他東西）
+            CGRect frame = [view convertRect:view.bounds toView:window];
+            if (frame.origin.y < 150) {
+                for (UIGestureRecognizer *g in view.gestureRecognizers) {
+                    if ([g isKindOfClass:UITapGestureRecognizer.class]) {
+                        PDDDiagEvent(@"auto.tap_search_entry", @{@"class": cls});
+                        // 手動觸發點擊手勢
+                        if ([g respondsToSelector:@selector(_sendAction)]) {
+                            [g performSelector:@selector(_sendAction)];
+                            return YES;
+                        }
+                    }
+                }
+                // 如果沒有手勢，嘗試直接讓它成為第一響應者或者模擬觸控
+                [view becomeFirstResponder];
+            }
+        }
+        for (UIView *child in view.subviews) [stack addObject:child];
+    }
+    return NO;
+}
+
 static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     if (!PDDCaptureEnabled() || !taskID.length || !keyword.length) return;
     NSDictionary *active = PDDActiveTaskSnapshot();
@@ -326,7 +357,16 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         if (PDDStringLooksLikeSearch(candidate.placeholder) || PDDStringLooksLikeSearch(candidate.accessibilityLabel) || PDDStringLooksLikeSearch(candidate.accessibilityIdentifier)) { target = candidate; break; }
     }
     if (!target && fields.count == 1) target = fields.firstObject;
+    
+    // 如果找不到輸入框，嘗試點擊結果頁頂部的搜尋入口
     if (!target) {
+        BOOL tapped = PDDTryTapSearchEntry(window);
+        if (tapped) {
+            PDDDiagEvent(@"search.tapped_entry", @{@"task": taskID});
+        } else if (gAutoSearchAttempts == 0) {
+            PDDDiagEvent(@"search.wait_for_manual_input", @{@"task": taskID});
+        }
+        
         if (++gAutoSearchAttempts <= 180) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 PDDAutoSearchAttempt(taskID, keyword);
