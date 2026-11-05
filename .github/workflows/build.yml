@@ -17,43 +17,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang
-
       - name: Setup Theos
-        run: |
-          export THEOS=$HOME/theos
-          
-          # 使用官方推薦的安裝方式
-          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
-          
-          # 安裝 ldid
-          mkdir -p $THEOS/bin
-          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
-          chmod +x $THEOS/bin/ldid
-          
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          echo "$THEOS/bin" >> $GITHUB_PATH
-
-      - name: Download iOS SDK
-        run: |
-          export THEOS=$HOME/theos
-          mkdir -p $THEOS/sdks
-          
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-          cd /tmp/sdks
-          git sparse-checkout set iPhoneOS15.6.sdk
-          mv iPhoneOS15.6.sdk $THEOS/sdks/
-          cd $GITHUB_WORKSPACE
-          rm -rf /tmp/sdks
+        uses: theos/theos-action@v1
 
       - name: Build
         run: |
           make clean || true
-          # 關鍵：明確指定使用 clang 作為連結器，避開系統 ld
-          make package TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=clang"
+          make package FINALPACKAGE=1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
