@@ -1,41 +1,44 @@
-name: Build PDD ReplicaShell 1.2.0 Dev
+name: Build PDDReplicaShell
 
 on:
   push:
-    branches: [ main, feature/1.2.0-auto-search ]
+    branches: [ main, master, feature/1.2.0-auto-search ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Setup Theos
-      run: |
-        export THEOS=~/theos
-        git clone --recursive https://github.com/theos/theos.git $THEOS
-        curl -LO https://github.com/theos/sdks/archive/master.zip
-        unzip -q master.zip -d $THEOS/sdks
-        mv $THEOS/sdks/sdks-master/* $THEOS/sdks/
-        rm -rf $THEOS/sdks/sdks-master master.zip
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils
 
-    - name: Install ldid and dpkg
-      run: |
-        brew install ldid dpkg
+      - name: Setup Theos
+        run: |
+          export THEOS=$HOME/theos
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          mkdir -p $THEOS/bin
+          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
+          chmod +x $THEOS/bin/ldid
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
 
-    - name: Build package
-      run: |
-        export THEOS=~/theos
-        cd PDD_iOS_Tweak_Scaffold_v1.2.0
-        make package THEOS_PACKAGE_SCHEME=rootless FINALPACKAGE=1
+      - name: Build
+        run: |
+          make clean || true
+          make package
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: PDD-ReplicaShell-1.2.0-Dev
-        path: |
-          PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
-          PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
-        if-no-files-found: warn
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PDDReplicaShell-build
+          path: |
+            packages/*.deb
+            .theos/obj/**/*.dylib
+          if-no-files-found: warn
