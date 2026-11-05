@@ -11,39 +11,34 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
+          # 完整拉取 Theos（macOS 环境下不需要管子模块，git 会自动处理）
           git clone --recursive https://github.com/theos/theos.git $THEOS
           
-          # 下載 Theos 官方的 Linux/macOS 通用工具鏈與 ldid
-          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o sdks.zip
-          unzip -q sdks.zip -d $THEOS/
-          mv $THEOS/sdks-master $THEOS/sdks
+          # 安装 ldid，macOS 下直接用 brew 是最稳的
+          brew install ldid
           
-          curl -sL https://github.com/theos/toolchain/releases/latest/download/macos-x86_64.tar.xz -o toolchain.tar.xz
-          mkdir -p $THEOS/toolchain/macos
-          tar -xJf toolchain.tar.xz -C $THEOS/toolchain/macos --strip-components=1
-
+          # 拉取 iOS SDK
+          git clone https://github.com/theos/sdks.git $THEOS/sdks
+          
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Build Package
         run: |
+          # 进入你的源码目录
           cd PDD_iOS_Tweak_Scaffold_v1.2.0
           
-          # 確保 Makefile 使用正確的目標
-          # 你的 Makefile 已經寫了 TARGET := iphone:clang:latest:14.0，這裡直接 make
+          # 直接跑你写的 Makefile，打包出 deb 和 dylib
           make clean || true
           make package FINALPACKAGE=1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PDDReplicaShell-Deb-and-Dylib
-          # 提取打包好的 deb 和編譯出的 dylib
+          name: PDDReplicaShell-Build
           path: |
             PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
             PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
