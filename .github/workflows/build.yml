@@ -20,42 +20,26 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip wget
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip curl lld clang
 
-      - name: Setup Theos & Toolchain (No Git)
+      - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
-          mkdir -p $THEOS/vendor
+          mkdir -p $THEOS
+          git clone --depth 1 https://github.com/theos/theos.git $THEOS
           
-          # 1. 下載 Theos 主體
-          wget -q https://github.com/theos/theos/archive/refs/heads/master.zip -O /tmp/theos.zip
-          unzip -q /tmp/theos.zip -d /tmp/
-          mv /tmp/theos-master/* $THEOS/
+          cd $THEOS
+          # 只拉取必須的組件，避免超時
+          git submodule update --init --depth 1 vendor/dm.pl vendor/logos vendor/include
+          cd - > /dev/null
           
-          # 2. 下載依賴組件（完美避開 git submodule 的 exit code 8）
-          wget -q https://github.com/theos/dm.pl/archive/refs/heads/master.zip -O /tmp/dm.zip
-          unzip -q /tmp/dm.zip -d /tmp/
-          mv /tmp/dm.pl-master $THEOS/vendor/dm.pl
-          
-          wget -q https://github.com/theos/logos/archive/refs/heads/master.zip -O /tmp/logos.zip
-          unzip -q /tmp/logos.zip -d /tmp/
-          mv /tmp/logos-master $THEOS/vendor/logos
-          
-          wget -q https://github.com/theos/headers/archive/refs/heads/master.zip -O /tmp/headers.zip
-          unzip -q /tmp/headers.zip -d /tmp/
-          mv /tmp/headers-master $THEOS/vendor/include
-          
-          wget -q https://github.com/theos/lib/archive/refs/heads/master.zip -O /tmp/lib.zip
-          unzip -q /tmp/lib.zip -d /tmp/
-          mv /tmp/lib-master $THEOS/vendor/lib
-          
-          # 3. 下載 ldid
           mkdir -p $THEOS/bin
-          wget -q https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -O $THEOS/bin/ldid
+          # 使用 curl -f --retry 3 保證下載成功
+          curl -sL -f --retry 3 https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
           
-          # 4. 下載 Theos 官方 Linux 專用工具鏈
-          wget -q https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz -O /tmp/toolchain.tar.xz
+          # 下載官方 Toolchain
+          curl -sL -f --retry 3 https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz -o /tmp/toolchain.tar.xz
           mkdir -p $THEOS/toolchain/linux
           tar -xJf /tmp/toolchain.tar.xz -C $THEOS/toolchain/linux --strip-components=1
           
@@ -66,15 +50,15 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           mkdir -p $THEOS/sdks
-          wget -q https://github.com/theos/sdks/archive/refs/heads/master.zip -O /tmp/sdks.zip
+          curl -sL -f --retry 3 https://github.com/theos/sdks/archive/refs/heads/master.zip -o /tmp/sdks.zip
           unzip -q /tmp/sdks.zip -d /tmp/
           mv /tmp/sdks-master/* $THEOS/sdks/
 
       - name: Build
         run: |
           make clean || true
-          # 直接編譯 dylib，跳過 deb 打包
-          make TARGET=iphone:clang:latest:14.0
+          # 使用官方工具鏈編譯 dylib
+          make TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=lld"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
