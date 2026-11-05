@@ -20,23 +20,41 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip wget
+          sudo apt-get install -y make perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip wget
 
-      - name: Setup Theos & Toolchain
+      - name: Setup Theos & Toolchain (No Git)
         run: |
           export THEOS=$HOME/theos
-          git clone --depth 1 https://github.com/theos/theos.git $THEOS
+          mkdir -p $THEOS/vendor
           
-          # 只拉取必需的子模組，避開無限的網路超時 (exit code 8)
-          cd $THEOS
-          git submodule update --init --recursive --depth 1 vendor/dm.pl vendor/include vendor/lib vendor/logos
-          cd - > /dev/null
+          # 1. 下載 Theos 主體
+          wget -q https://github.com/theos/theos/archive/refs/heads/master.zip -O /tmp/theos.zip
+          unzip -q /tmp/theos.zip -d /tmp/
+          mv /tmp/theos-master/* $THEOS/
           
+          # 2. 下載依賴組件（完美避開 git submodule 的 exit code 8）
+          wget -q https://github.com/theos/dm.pl/archive/refs/heads/master.zip -O /tmp/dm.zip
+          unzip -q /tmp/dm.zip -d /tmp/
+          mv /tmp/dm.pl-master $THEOS/vendor/dm.pl
+          
+          wget -q https://github.com/theos/logos/archive/refs/heads/master.zip -O /tmp/logos.zip
+          unzip -q /tmp/logos.zip -d /tmp/
+          mv /tmp/logos-master $THEOS/vendor/logos
+          
+          wget -q https://github.com/theos/headers/archive/refs/heads/master.zip -O /tmp/headers.zip
+          unzip -q /tmp/headers.zip -d /tmp/
+          mv /tmp/headers-master $THEOS/vendor/include
+          
+          wget -q https://github.com/theos/lib/archive/refs/heads/master.zip -O /tmp/lib.zip
+          unzip -q /tmp/lib.zip -d /tmp/
+          mv /tmp/lib-master $THEOS/vendor/lib
+          
+          # 3. 下載 ldid
           mkdir -p $THEOS/bin
-          curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
+          wget -q https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -O $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
           
-          # 下載 Theos 官方 Linux 專用工具鏈（完美解決 std 和 libc++ 找不到的問題）
+          # 4. 下載 Theos 官方 Linux 專用工具鏈
           wget -q https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz -O /tmp/toolchain.tar.xz
           mkdir -p $THEOS/toolchain/linux
           tar -xJf /tmp/toolchain.tar.xz -C $THEOS/toolchain/linux --strip-components=1
