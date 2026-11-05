@@ -8,44 +8,53 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./PDD_iOS_Tweak_Scaffold_v1.2.0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev xz-utils unzip curl wget clang lld
+          sudo apt-get install -y curl wget unzip clang lld xz-utils
 
       - name: Download Dependencies
         run: |
-          mkdir -p $GITHUB_WORKSPACE/deps
-          cd $GITHUB_WORKSPACE/deps
+          mkdir -p deps
+          cd deps
           
-          wget -q --tries=5 https://github.com/theos/logos/archive/refs/heads/master.zip -O logos.zip && unzip -q logos.zip
-          wget -q --tries=5 https://github.com/theos/headers/archive/refs/heads/master.zip -O headers.zip && unzip -q headers.zip
-          wget -q --tries=5 https://github.com/theos/sdks/archive/refs/heads/master.zip -O sdks.zip && unzip -q sdks.zip
+          echo "Downloading Logos..."
+          curl -sL --retry 3 -o logos.zip https://github.com/theos/logos/archive/refs/heads/master.zip
+          unzip -q logos.zip
           
-          wget -q --tries=5 https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -O ldid
+          echo "Downloading Headers..."
+          curl -sL --retry 3 -o headers.zip https://github.com/theos/headers/archive/refs/heads/master.zip
+          unzip -q headers.zip
+          
+          echo "Downloading SDKs..."
+          curl -sL --retry 3 -o sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q sdks.zip
+          
+          echo "Downloading ldid..."
+          curl -sL --retry 3 -o ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
           chmod +x ldid
 
       - name: Build Dylib
         run: |
-          DEPS="$GITHUB_WORKSPACE/deps"
+          echo "=== Current Directory Structure ==="
+          find . -maxdepth 2 -type f | head -n 50
+          
+          DEPS="$PWD/deps"
           SDK_PATH="$DEPS/sdks-master/iPhoneOS15.6.sdk"
           LOGOS_PL="$DEPS/logos-master/bin/logos.pl"
           HEADERS="$DEPS/headers-master/include"
 
-          # 1. 用 Logos 預處理器將 .xm 轉換為純 ObjC 代碼 .mm
+          # 1. 預處理 Logos (將 .xm 轉為 .mm)
+          echo "=== Preprocessing Logos ==="
           perl $LOGOS_PL Tweak.xm > Tweak.mm
           perl $LOGOS_PL PDDInputHooks.xm > PDDInputHooks.mm
 
-          # 2. 使用系統的 clang 直接編譯並鏈接，動態查找未定義符號（避免找不到 substrate 庫）
+          # 2. 直接使用系統 clang 編譯
+          echo "=== Compiling Dylib ==="
           clang++ -dynamiclib \
             -arch arm64 -arch arm64e \
             -mios-version-min=14.0 \
@@ -59,12 +68,14 @@ jobs:
             PDDDiagnostics.m Tweak.mm PDDInputHooks.mm \
             -o PDDReplicaShell.dylib
 
-          # 3. 使用 ldid 簽名
+          # 3. 簽名
+          echo "=== Signing Dylib ==="
           $DEPS/ldid -S PDDReplicaShell.dylib
+          ls -la PDDReplicaShell.dylib
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PDDReplicaShell-dylib
-          path: PDD_iOS_Tweak_Scaffold_v1.2.0/PDDReplicaShell.dylib
+          path: PDDReplicaShell.dylib
           if-no-files-found: warn
