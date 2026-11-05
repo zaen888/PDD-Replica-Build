@@ -8,57 +8,20 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./PDD_iOS_Tweak_Scaffold_v1.2.0
+    container:
+      image: theos/theos:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip curl lld clang
-
-      - name: Setup Theos
-        run: |
-          export THEOS=$HOME/theos
-          mkdir -p $THEOS
-          git clone --depth 1 https://github.com/theos/theos.git $THEOS
-          
-          cd $THEOS
-          # 只拉取必須的組件，避免超時
-          git submodule update --init --depth 1 vendor/dm.pl vendor/logos vendor/include
-          cd - > /dev/null
-          
-          mkdir -p $THEOS/bin
-          # 使用 curl -f --retry 3 保證下載成功
-          curl -sL -f --retry 3 https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
-          chmod +x $THEOS/bin/ldid
-          
-          # 下載官方 Toolchain
-          curl -sL -f --retry 3 https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz -o /tmp/toolchain.tar.xz
-          mkdir -p $THEOS/toolchain/linux
-          tar -xJf /tmp/toolchain.tar.xz -C $THEOS/toolchain/linux --strip-components=1
-          
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          echo "$THEOS/bin" >> $GITHUB_PATH
-
-      - name: Download iOS SDK
-        run: |
-          export THEOS=$HOME/theos
-          mkdir -p $THEOS/sdks
-          curl -sL -f --retry 3 https://github.com/theos/sdks/archive/refs/heads/master.zip -o /tmp/sdks.zip
-          unzip -q /tmp/sdks.zip -d /tmp/
-          mv /tmp/sdks-master/* $THEOS/sdks/
-
       - name: Build
+        working-directory: PDD_iOS_Tweak_Scaffold_v1.2.0
         run: |
           make clean || true
-          # 使用官方工具鏈編譯 dylib
-          make TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=lld"
+          # 直接使用完美環境編譯
+          make TARGET=iphone:clang:latest:14.0
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
