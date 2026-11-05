@@ -20,7 +20,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang llvm lld
 
       - name: Setup Theos
         run: |
@@ -30,11 +30,10 @@ jobs:
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
           
-          # 解決找不到 clang 的問題：建立軟連結
+          # 建立 clang 鏈接，絕對不要建 ld 的鏈接！
           mkdir -p $THEOS/toolchain/linux/iphone/bin
           ln -sf $(which clang) $THEOS/toolchain/linux/iphone/bin/clang
           ln -sf $(which clang++) $THEOS/toolchain/linux/iphone/bin/clang++
-          ln -sf $(which ld) $THEOS/toolchain/linux/iphone/bin/ld
           
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
