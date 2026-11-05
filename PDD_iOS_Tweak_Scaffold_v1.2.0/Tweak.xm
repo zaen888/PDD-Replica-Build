@@ -346,42 +346,37 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     }
 
     target.text = @"";
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        target.text = keyword;
-        [target sendActionsForControlEvents:UIControlEventEditingChanged];
+    [target sendActionsForControlEvents:UIControlEventEditingChanged];
+    
+    UITextRange *range = [target textRangeFromPosition:target.beginningOfDocument toPosition:target.endOfDocument];
+    [target replaceRange:range withText:keyword];
+    [target sendActionsForControlEvents:UIControlEventEditingChanged];
+
+    // 減少等待時間，防止被拼多多覆蓋
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSDictionary *latest = PDDActiveTaskSnapshot();
+        if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
         
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            NSDictionary *latest = PDDActiveTaskSnapshot();
-            if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
-            
-            NSString *actual = target.text ?: @"";
-            if (![actual isEqualToString:keyword]) {
-                PDDDiagEvent(@"search.verify_failed", @{@"expected": keyword, @"actual": actual});
-                
-                target.text = keyword;
-                [target sendActionsForControlEvents:UIControlEventEditingChanged];
-                
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    UIButton *submit = buttons.firstObject;
-                    if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
-                    else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
-                    gAutoSearchSubmitted = YES;
-                    gAutoCollectState = 1;
-                    gAutoPhaseTicks = 0;
-                    PDDDiagEvent(@"search.submitted_force", @{@"keyword": keyword});
-                    PDDAutoScheduleTick(1.0);
-                });
-            } else {
-                UIButton *submit = buttons.firstObject;
-                if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
-                else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
-                gAutoSearchSubmitted = YES;
-                gAutoCollectState = 1;
-                gAutoPhaseTicks = 0;
-                PDDDiagEvent(@"search.submitted", @{@"keyword": keyword});
-                PDDAutoScheduleTick(1.0);
-            }
-        });
+        NSString *actual = target.text ?: @"";
+        if (![actual isEqualToString:keyword]) {
+            PDDDiagEvent(@"search.verify_failed_fix", @{@"expected": keyword, @"actual": actual});
+            target.text = keyword;
+            [target sendActionsForControlEvents:UIControlEventEditingChanged];
+        }
+        
+        // 立即提交
+        UIButton *submit = buttons.firstObject;
+        if (submit && submit.enabled) {
+            [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+        } else {
+            [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+        }
+        
+        gAutoSearchSubmitted = YES;
+        gAutoCollectState = 1;
+        gAutoPhaseTicks = 0;
+        PDDDiagEvent(@"search.submitted", @{@"keyword": keyword});
+        PDDAutoScheduleTick(1.0);
     });
 }
 
