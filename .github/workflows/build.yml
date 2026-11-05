@@ -32,8 +32,9 @@ jobs:
           
           echo "Downloading substrate.h..."
           curl -sL --retry 3 -o substrate.h https://raw.githubusercontent.com/theos/headers/master/substrate.h
-          # 修正：直接放進 headers-master 根目錄
-          mv substrate.h headers-master/
+          # 強制建立目錄，防止 "Not a directory" 錯誤
+          mkdir -p headers-master/include
+          mv substrate.h headers-master/include/
           
           echo "Downloading SDKs..."
           curl -sL --retry 3 -o sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
@@ -48,7 +49,7 @@ jobs:
           DEPS="$PWD/deps"
           SDK_PATH="$DEPS/sdks-master/iPhoneOS15.6.sdk"
           LOGOS_PL="$DEPS/logos-master/bin/logos.pl"
-          HEADERS="$DEPS/headers-master"
+          HEADERS="$DEPS/headers-master/include"
 
           cd PDD_iOS_Tweak_Scaffold_v1.2.0
 
