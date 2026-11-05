@@ -15,7 +15,8 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl wget unzip clang lld xz-utils
+          # 安装 clang 和 llvm (包含 llvm-lipo 合并工具)
+          sudo apt-get install -y curl wget unzip clang llvm xz-utils
 
       - name: Download Dependencies
         run: |
@@ -23,19 +24,19 @@ jobs:
           cd deps
           
           echo "Downloading Logos..."
-          curl -sL --retry 3 -o logos.zip https://github.com/theos/logos/archive/refs/heads/master.zip
+          curl -fL --retry 5 --retry-delay 2 -o logos.zip https://github.com/theos/logos/archive/refs/heads/master.zip
           unzip -q logos.zip
           
           echo "Downloading Headers..."
-          curl -sL --retry 3 -o headers.zip https://github.com/theos/headers/archive/refs/heads/master.zip
+          curl -fL --retry 5 --retry-delay 2 -o headers.zip https://github.com/theos/headers/archive/refs/heads/master.zip
           unzip -q headers.zip
           
           echo "Downloading SDKs..."
-          curl -sL --retry 3 -o sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
+          curl -fL --retry 5 --retry-delay 2 -o sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
           unzip -q sdks.zip
           
           echo "Downloading ldid..."
-          curl -sL --retry 3 -o ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          curl -fL --retry 5 --retry-delay 2 -o ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
           chmod +x ldid
 
       - name: Build Dylib
@@ -45,13 +46,13 @@ jobs:
           LOGOS_PL="$DEPS/logos-master/bin/logos.pl"
           HEADERS="$DEPS/headers-master/include"
 
-          # 直接寫死進入 1.2.0 目錄
+          # 进入源码目录 (请确认你的文件夹名字完全一致，如果有拼写错误请修改下面这行)
           cd PDD_iOS_Tweak_Scaffold_v1.2.0
           
-          echo "=== 目前目錄下的文件 ==="
+          echo "=== 文件列表 ==="
           ls -la
 
-          echo "=== Preprocessing Logos ==="
+          echo "=== 预处理 Logos ==="
           perl $LOGOS_PL Tweak.xm > Tweak.mm
           if [ -f PDDInputHooks.xm ]; then
             perl $LOGOS_PL PDDInputHooks.xm > PDDInputHooks.mm
@@ -62,22 +63,27 @@ jobs:
             SOURCES="$SOURCES PDDInputHooks.mm"
           fi
 
-          echo "=== Compiling Dylib ==="
-          clang++ -dynamiclib \
-            -arch arm64 -arch arm64e \
-            -mios-version-min=14.0 \
-            -isysroot "$SDK_PATH" \
-            -F"$SDK_PATH/System/Library/Frameworks" \
-            -F"$SDK_PATH/System/Library/PrivateFrameworks" \
-            -I"$HEADERS" \
+          # 核心参数：使用 -target 而不是 -arch，完美适配 Linux 的 clang
+          CFLAGS="-isysroot $SDK_PATH \
+            -F$SDK_PATH/System/Library/Frameworks \
+            -F$SDK_PATH/System/Library/PrivateFrameworks \
+            -I$HEADERS -I. \
             -framework Foundation -framework UIKit -framework CoreFoundation \
-            -lz -Wl,-undefined,dynamic_lookup \
-            -fobjc-arc -fmodules -fblocks -DTHEOS_PACKAGE_NAME=\"com.local.pddreplicashell\" \
-            $SOURCES \
-            -o PDDReplicaShell.dylib
+            -Wl,-undefined,dynamic_lookup \
+            -fobjc-arc -fmodules -fblocks -dynamiclib"
 
-          echo "=== Signing Dylib ==="
+          echo "=== 编译 arm64 ==="
+          clang++ -target arm64-apple-ios14.0 $CFLAGS $SOURCES -o arm64.dylib
+
+          echo "=== 编译 arm64e ==="
+          clang++ -target arm64e-apple-ios14.0 $CFLAGS $SOURCES -o arm64e.dylib
+
+          echo "=== 合并双架构 ==="
+          llvm-lipo -create -output PDDReplicaShell.dylib arm64.dylib arm64e.dylib
+
+          echo "=== 签名 ==="
           $DEPS/ldid -S PDDReplicaShell.dylib
+          
           mv PDDReplicaShell.dylib $GITHUB_WORKSPACE/
           ls -la $GITHUB_WORKSPACE/PDDReplicaShell.dylib
 
