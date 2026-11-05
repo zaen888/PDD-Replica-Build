@@ -20,13 +20,13 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          # 加上了 dpkg-dev 和 dpkg，解決找不到 dpkg-deb 的問題
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang lld unzip dpkg-dev dpkg
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang lld unzip
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
-          git clone --depth 1 https://github.com/theos/theos.git $THEOS
+          # 關鍵修復：加上 --recursive 把 dm.pl 等子模組拉下來
+          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
           mkdir -p $THEOS/bin
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
@@ -45,13 +45,13 @@ jobs:
       - name: Build
         run: |
           make clean || true
-          make package TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=lld"
+          # 關鍵修復：不跑 make package（不打 deb 包），直接 make 生成 dylib
+          make TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=lld"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PDDReplicaShell-build
-          path: |
-            PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
-            PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
+          name: PDDReplicaShell-dylib
+          # 直接提取編譯好的 dylib
+          path: PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
           if-no-files-found: warn
