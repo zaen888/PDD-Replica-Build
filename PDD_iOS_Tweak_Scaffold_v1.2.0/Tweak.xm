@@ -279,30 +279,31 @@ static BOOL PDDStringLooksLikeSearch(NSString *value) {
     return [v containsString:@"搜索"] || [v containsString:@"搜尋"] || [v containsString:@"search"];
 }
 
-// 修改：不再过滤，只要是 UITextField 就先收集起来
-static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *> *fields, NSMutableArray<UIButton *> *buttons) {
+// 收集 UIControl 控件
+static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *> *fields, NSMutableArray<UIButton *> *buttons, NSMutableArray<UISearchBar *> *searchBars) {
     if (!view || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return;
+    
     if ([view isKindOfClass:UISearchBar.class]) {
         UISearchBar *bar = (UISearchBar *)view;
-        if (@available(iOS 13.0, *)) {
-            UITextField *field = bar.searchTextField;
-            if (field && ![fields containsObject:field]) [fields addObject:field];
-        }
+        if (![searchBars containsObject:bar]) [searchBars addObject:bar];
     }
+    
     if ([view isKindOfClass:UITextField.class]) {
         UITextField *field = (UITextField *)view;
         if (![fields containsObject:field]) [fields addObject:field];
     }
+    
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
         NSString *title = [button titleForState:UIControlStateNormal];
         BOOL identified = PDDStringLooksLikeSearch(title) || PDDStringLooksLikeSearch(button.accessibilityLabel) || PDDStringLooksLikeSearch(button.accessibilityIdentifier);
         if (identified && ![buttons containsObject:button]) [buttons addObject:button];
     }
-    for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons);
+    
+    for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons, searchBars);
 }
 
-// 增加：更暴力的模拟点击，直接触发 Gesture 的 target 和 action
+// 暴力模拟点击（保底）
 static BOOL PDDTryTapSearchEntry(UIWindow *window) {
     if (!window) return NO;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
@@ -316,7 +317,6 @@ static BOOL PDDTryTapSearchEntry(UIWindow *window) {
                     if ([g isKindOfClass:UITapGestureRecognizer.class]) {
                         PDDDiagEvent(@"force.tap_entry", @{@"class": cls});
                         @try {
-                            // 直接通过 KVC 取目标并强制调用
                             id targets = [g valueForKey:@"_targets"];
                             if ([targets isKindOfClass:NSArray.class]) {
                                 for (id entry in (NSArray *)targets) {
@@ -341,6 +341,7 @@ static BOOL PDDTryTapSearchEntry(UIWindow *window) {
     return NO;
 }
 
+// 核心搜索逻辑
 static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     if (!PDDCaptureEnabled() || !taskID.length || !keyword.length) return;
     NSDictionary *active = PDDActiveTaskSnapshot();
@@ -359,30 +360,41 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
 
     NSMutableArray<UITextField *> *fields = [NSMutableArray array];
     NSMutableArray<UIButton *> *buttons = [NSMutableArray array];
-    PDDCollectSearchControls(window, fields, buttons);
+    NSMutableArray<UISearchBar *> *searchBars = [NSMutableArray array];
+    PDDCollectSearchControls(window, fields, buttons, searchBars);
     
     UITextField *target = nil;
-    
-    // 1. 优先找带 search 特征的
-    for (UITextField *candidate in fields) {
-        if (PDDStringLooksLikeSearch(candidate.placeholder) || PDDStringLooksLikeSearch(candidate.accessibilityLabel) || PDDStringLooksLikeSearch(candidate.accessibilityIdentifier)) { 
-            target = candidate; 
-            break; 
+    UISearchBar *targetBar = searchBars.firstObject;
+
+    // 1. 优先从 UISearchBar 提取输入框
+    if (targetBar) {
+        if (@available(iOS 13.0, *)) {
+            target = targetBar.searchTextField;
+        } else {
+            target = [targetBar valueForKey:@"_searchField"];
         }
     }
     
-    // 2. 如果没有，找屏幕上半部分看起来像输入框的
-    if (!target) {
+    // 2. 退而求其次，从 UITextField 找
+    if (!target && fields.count > 0) {
         for (UITextField *candidate in fields) {
-            CGRect frame = [candidate convertRect:candidate.bounds toView:window];
-            if (frame.origin.y < 200 && frame.size.width > 50) {
-                target = candidate;
-                break;
+            if (PDDStringLooksLikeSearch(candidate.placeholder) || PDDStringLooksLikeSearch(candidate.accessibilityLabel) || PDDStringLooksLikeSearch(candidate.accessibilityIdentifier)) { 
+                target = candidate; 
+                break; 
+            }
+        }
+        if (!target) {
+            for (UITextField *candidate in fields) {
+                CGRect frame = [candidate convertRect:candidate.bounds toView:window];
+                if (frame.origin.y < 200 && frame.size.width > 50) {
+                    target = candidate;
+                    break;
+                }
             }
         }
     }
     
-    // 3. 如果死活找不到，说明在结果页，得强行去点搜索框唤醒它
+    // 3. 如果还找不到，只能强行点击搜索入口唤醒
     if (!target) {
         BOOL tapped = PDDTryTapSearchEntry(window);
         if (tapped && gAutoSearchAttempts == 0) {
@@ -399,7 +411,7 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         return;
     }
 
-    // 强制让它获取焦点
+    // 强制激活输入框
     if (![target becomeFirstResponder] && !target.isFirstResponder) {
         PDDDiagEvent(@"search.force_become_first_responder_failed", @{@"class": NSStringFromClass(target.class)});
         UIPasteboard.generalPasteboard.string = keyword;
@@ -409,14 +421,24 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         return;
     }
 
+    // 写入逻辑
     target.text = @"";
     [target sendActionsForControlEvents:UIControlEventEditingChanged];
     
-    UITextRange *range = [target textRangeFromPosition:target.beginningOfDocument toPosition:target.endOfDocument];
-    [target replaceRange:range withText:keyword];
+    target.text = keyword;
     [target sendActionsForControlEvents:UIControlEventEditingChanged];
+    
+    // 【核心注入】如果外面包着 UISearchBar，强制通知它的 Delegate 进行数据层同步
+    if (targetBar) {
+        targetBar.text = keyword;
+        id delegate = targetBar.delegate;
+        if (delegate && [delegate respondsToSelector:@selector(searchBar:textDidChange:)]) {
+            PDDDiagEvent(@"force.delegate.textDidChange", @{@"keyword": keyword});
+            [delegate searchBar:targetBar textDidChange:keyword];
+        }
+    }
 
-    // 減少等待時間，防止被拼多多覆蓋
+    // 验证并提交
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSDictionary *latest = PDDActiveTaskSnapshot();
         if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
@@ -428,12 +450,22 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
             [target sendActionsForControlEvents:UIControlEventEditingChanged];
         }
         
-        // 立即提交
-        UIButton *submit = buttons.firstObject;
-        if (submit && submit.enabled) {
-            [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+        // 【核心注入】触发搜索
+        if (targetBar) {
+            id delegate = targetBar.delegate;
+            if (delegate && [delegate respondsToSelector:@selector(searchBarSearchButtonClicked:)]) {
+                PDDDiagEvent(@"force.delegate.searchButtonClicked", @{@"keyword": keyword});
+                [delegate searchBarSearchButtonClicked:targetBar];
+            } else {
+                [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+            }
         } else {
-            [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+            UIButton *submit = buttons.firstObject;
+            if (submit && submit.enabled) {
+                [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+            } else {
+                [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+            }
         }
         
         gAutoSearchSubmitted = YES;
@@ -456,7 +488,6 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
     gAutoPhaseTicks = 0;
     gAutoVisitedIndexPaths = [NSMutableSet set];
     UIPasteboard.generalPasteboard.string = keyword;
-    // 增加延迟，等待详情页返回结果页后 UI 稳定
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         PDDAutoSearchAttempt(taskID, keyword);
     });
@@ -802,33 +833,34 @@ __attribute__((unused)) static NSString *PDDGestureTargetSummary(UIGestureRecogn
     return parts.count ? [parts componentsJoinedByString:@","] : @"target/action unavailable";
 }
 
+// 【放宽限制】：不再强依赖具体的类名，只要 UICollectionView 高度合适且有可见 cell，就算主列表
 static BOOL PDDFindTestCollection(UIView *view, UICollectionView **collectionOut, NSIndexPath **indexPathOut, NSString **reasonOut) {
     if (!view) return NO;
     if ([view isKindOfClass:UICollectionView.class]) {
         UICollectionView *cv = (UICollectionView *)view;
         id delegate = cv.delegate;
-        NSString *delegateName = delegate ? NSStringFromClass([delegate class]) : @"nil";
         SEL selector = NSSelectorFromString(@"collectionView:didSelectItemAtIndexPath:");
-        if ([delegateName containsString:@"PDDSearchResultPageContainerModule"] &&
-            [delegate respondsToSelector:selector]) {
-            NSArray<NSIndexPath *> *paths = [cv.indexPathsForVisibleItems sortedArrayUsingComparator:^NSComparisonResult(NSIndexPath *a, NSIndexPath *b) {
-                if (a.section < b.section) return NSOrderedAscending;
-                if (a.section > b.section) return NSOrderedDescending;
-                if (a.item < b.item) return NSOrderedAscending;
-                if (a.item > b.item) return NSOrderedDescending;
-                return NSOrderedSame;
-            }];
-            for (NSIndexPath *path in paths) {
-                UICollectionViewCell *cell = [cv cellForItemAtIndexPath:path];
-                NSString *cellName = cell ? NSStringFromClass(cell.class) : @"nil";
-                if (cell && [cellName containsString:@"PDDSRDoubleColNormalGoodsCell"] && !cell.hidden && cell.alpha > 0.05) {
-                    if (collectionOut) *collectionOut = cv;
-                    if (indexPathOut) *indexPathOut = path;
-                    if (reasonOut) *reasonOut = [NSString stringWithFormat:@"delegate=%@ cell=%@ indexPath=%@", delegateName, cellName, path];
-                    return YES;
+        
+        if ([delegate respondsToSelector:selector] && cv.indexPathsForVisibleItems.count > 0) {
+            CGRect frame = [cv convertRect:cv.bounds toView:PDDActiveWindow()];
+            if (frame.size.height > 200) { // 避开顶部筛选栏
+                NSArray<NSIndexPath *> *paths = [cv.indexPathsForVisibleItems sortedArrayUsingComparator:^NSComparisonResult(NSIndexPath *a, NSIndexPath *b) {
+                    if (a.section < b.section) return NSOrderedAscending;
+                    if (a.section > b.section) return NSOrderedDescending;
+                    if (a.item < b.item) return NSOrderedAscending;
+                    if (a.item > b.item) return NSOrderedDescending;
+                    return NSOrderedSame;
+                }];
+                for (NSIndexPath *path in paths) {
+                    UICollectionViewCell *cell = [cv cellForItemAtIndexPath:path];
+                    if (cell && !cell.hidden && cell.alpha > 0.05) {
+                        if (collectionOut) *collectionOut = cv;
+                        if (indexPathOut) *indexPathOut = path;
+                        if (reasonOut) *reasonOut = [NSString stringWithFormat:@"delegate=%@ cell=%@", NSStringFromClass([delegate class]), NSStringFromClass(cell.class)];
+                        return YES;
+                    }
                 }
             }
-            if (reasonOut) *reasonOut = [NSString stringWithFormat:@"已找到列表 %@，但沒有可用的可見商品卡片。", delegateName];
         }
     }
     for (UIView *child in view.subviews) {
@@ -986,7 +1018,7 @@ static void PDDAutoCollectTick(void) {
         NSIndexPath *chosen = nil;
         for (NSIndexPath *path in paths) {
             UICollectionViewCell *cell = [collection cellForItemAtIndexPath:path];
-            if (!cell || ![NSStringFromClass(cell.class) containsString:@"PDDSRDoubleColNormalGoodsCell"]) continue;
+            if (!cell) continue; // 这里去掉了具体类名限制
             NSString *key = [NSString stringWithFormat:@"%ld-%ld", (long)path.section, (long)path.item];
             if (![gAutoVisitedIndexPaths containsObject:key]) { chosen = path; break; }
         }
