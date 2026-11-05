@@ -3,6 +3,7 @@
 #import <zlib.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import "PDDDiagnostics.h"
 
 static NSString * const kDataFolderName = @"PDDGoodsData";
 static const NSInteger kFloatingButtonTag = 0x50444452;
@@ -463,6 +464,11 @@ static BOOL PDDSetActiveTask(NSDictionary *task, BOOL notify) {
 }
 
 static void PDDClearActiveTask(void) {
+    PDDDiagEvent(@"task.clear", @{
+        @"active_before": gActiveTaskID ?: @"",
+        @"auto_state": @(gAutoCollectState),
+        @"pending_return": @(gAutoTaskCompletedPendingReturn)
+    });
     gAutoSearchTaskID = nil; gAutoSearchAttempts = 0; gAutoSearchSubmitted = NO;
     gAutoCollectState = 0; gAutoExpectedGoodsID = nil; gAutoScrollAttempts = 0; gAutoPhaseTicks = 0;
     gAutoTaskCompletedPendingReturn = NO;
@@ -677,6 +683,13 @@ static void PDDCloudTick(void) {
                 NSLog(@"[PDDReplica] task claim failed status=%ld %@", (long)statusCode, error.localizedDescription ?: @"");
                 return;
             }
+            PDDDiagEvent(@"claim.response", @{
+                @"status": @(statusCode),
+                @"paused": result[@"paused"] ?: @NO,
+                @"has_task": @(result[@"task"] != nil),
+                @"task_id": result[@"task"][@"task_id"] ?: @"",
+                @"active_before": PDDActiveTaskSnapshot()[@"task_id"] ?: @""
+            });
             if ([result[@"paused"] boolValue]) return;
             NSDictionary *task = [result[@"task"] isKindOfClass:NSDictionary.class] ? result[@"task"] : nil;
             if (task) {
@@ -1215,6 +1228,15 @@ static void PDDShowControlMenu(UIButton *button) {
         [menu addAction:[UIAlertAction actionWithTitle:@"開始自動採集目前搜尋結果" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDStartAutoCollectCurrentResults(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"測試打開第一個商品（單次）" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDTestOpenFirstVisibleProduct(); }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"複製目前介面診斷" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { PDDCopyInterfaceDiagnostics(); }]];
+        [menu addAction:[UIAlertAction actionWithTitle:@"匯出診斷日誌" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIWindow *w = PDDActiveWindow();
+                UIViewController *p = w.rootViewController;
+                if (!p) return;
+                while (p.presentedViewController) p = p.presentedViewController;
+                [[PDDDiagnostics shared] presentExportFromViewController:p sourceView:button];
+            });
+        }]];
         [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
         if (menu.popoverPresentationController) {
             menu.popoverPresentationController.sourceView = button ?: presenter.view;
@@ -1293,6 +1315,7 @@ static void PDDInstallFloatingButton(void) {
 
 %ctor {
     @autoreleasepool {
+        [[PDDDiagnostics shared] start];
         gEnabled = [NSUserDefaults.standardUserDefaults objectForKey:kEnabledDefaultsKey] ? [NSUserDefaults.standardUserDefaults boolForKey:kEnabledDefaultsKey] : YES;
         gCaptureQueue = dispatch_queue_create("com.local.pddreplica.capture", DISPATCH_QUEUE_SERIAL);
         gUploadingPaths = [NSMutableSet set];
