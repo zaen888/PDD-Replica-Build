@@ -53,7 +53,6 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword);
 static void PDDAutoCollectTick(void);
 static void PDDAutoScheduleTick(NSTimeInterval delay);
 static void PDDAutoUploadConfirmed(NSString *goodsID);
-static void PDDAutoPause(NSString *reason);
 
 static BOOL PDDCaptureEnabled(void) {
     @synchronized ([UIApplication class]) { return gEnabled; }
@@ -356,21 +355,19 @@ static UIView *PDDFindSearchEntry(UIView *view) {
     return nil;
 }
 
-static BOOL PDDActivateSearchEntry(UIView *entry) {
-    if (!entry) return NO;
+static void PDDActivateSearchEntry(UIView *entry) {
+    if (!entry) return;
     if ([entry isKindOfClass:UIControl.class]) {
         [(UIControl *)entry sendActionsForControlEvents:UIControlEventTouchUpInside];
-        return YES;
+        return;
     }
     if ([entry respondsToSelector:@selector(accessibilityActivate)]) {
         BOOL activated = ((BOOL (*)(id, SEL))objc_msgSend)(entry, @selector(accessibilityActivate));
-        if (activated) return YES;
+        if (activated) return;
     }
 
-    // The home diagnostic identifies this custom view as the search entry.
-    // Its own tap recognizer is the authoritative action source. Do not require
-    // the target object's class to have the same name as the view: UIKit/app
-    // versions may place the action on a coordinator/delegate object.
+    // The diagnosed PDDSearchBarInputField is a custom UIView, not a UIButton.
+    // Invoke only its own PDD tap-gesture target/action; do not synthesize screen taps.
     for (UIGestureRecognizer *gesture in entry.gestureRecognizers ?: @[]) {
         if (![gesture isKindOfClass:UITapGestureRecognizer.class] || !gesture.enabled) continue;
         NSArray *targets = nil;
@@ -385,24 +382,18 @@ static BOOL PDDActivateSearchEntry(UIView *entry) {
                 else if ([actionValue respondsToSelector:@selector(pointerValue)]) action = (SEL)[actionValue pointerValue];
             } @catch (__unused NSException *e) {}
             if (!target || !action || ![target respondsToSelector:action]) continue;
+            NSString *targetClass = NSStringFromClass([target class]);
+            if (![targetClass containsString:@"PDDSearchBarInputField"]) continue;
             NSMethodSignature *sig = [target methodSignatureForSelector:action];
-            if (!sig || sig.numberOfArguments < 2 || sig.numberOfArguments > 3 || strcmp(sig.methodReturnType, @encode(void)) != 0) continue;
-            @try {
-                if (sig.numberOfArguments == 3)
-                    ((void (*)(id, SEL, id))objc_msgSend)(target, action, gesture);
-                else
-                    ((void (*)(id, SEL))objc_msgSend)(target, action);
-                NSLog(@"[PDDReplica] invoked search tap action %@ target=%@ view=%@",
-                      NSStringFromSelector(action), NSStringFromClass([target class]), NSStringFromClass(entry.class));
-                return YES;
-            } @catch (NSException *exception) {
-                NSLog(@"[PDDReplica] search tap action %@ exception: %@", NSStringFromSelector(action), exception.reason ?: @"unknown");
+            if (sig.numberOfArguments >= 3) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, action, gesture);
+            } else {
+                ((void (*)(id, SEL))objc_msgSend)(target, action);
             }
+            NSLog(@"[PDDReplica] activated diagnosed search tap action %@ on %@", NSStringFromSelector(action), targetClass);
+            return;
         }
     }
-    NSLog(@"[PDDReplica] could not invoke tap action for search entry class=%@ gestures=%lu",
-          NSStringFromClass(entry.class), (unsigned long)entry.gestureRecognizers.count);
-    return NO;
 }
 
 static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
@@ -430,74 +421,62 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     }
     if (!target && fields.count == 1) target = fields.firstObject;
     if (!target) {
-        UIView *entry = PDDFindSearchEntry(window);
-        if (entry && gAutoSearchAttempts < 45) {
-            gAutoSearchAttempts++;
-            NSLog(@"[PDDReplica] opening search entry class=%@ label=%@", NSStringFromClass(entry.class), entry.accessibilityLabel ?: @"");
-            BOOL activated = PDDActivateSearchEntry(entry);
-            NSLog(@"[PDDReplica] home search entry activation result=%@ attempt=%lu",
-                  activated ? @"YES" : @"NO", (unsigned long)gAutoSearchAttempts);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)((activated ? 1.0 : 0.6) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                PDDAutoSearchAttempt(taskID, keyword);
-            });
-            return;
-        }
-        if (++gAutoSearchAttempts <= 45) {
+        // User workflow: they manually navigate to Pinduoduo's search input page.
+        // Never activate the home-page search entry from this automation.
+        if (++gAutoSearchAttempts <= 180) {
+            if (gAutoSearchAttempts == 1 || gAutoSearchAttempts % 15 == 0) {
+                NSLog(@"[PDDReplica] waiting for user to open search input page task=%@ attempt=%lu", taskID, (unsigned long)gAutoSearchAttempts);
+            }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 PDDAutoSearchAttempt(taskID, keyword);
             });
             return;
         }
         UIPasteboard.generalPasteboard.string = keyword;
-        PDDShowMessage(@"無法自動進入搜尋頁", [NSString stringWithFormat:@"已嘗試辨識首頁搜尋入口，但未找到可安全操作的控制項。關鍵詞已複製：%@。請手動進入搜尋頁後重新開始任務。", keyword]);
+        NSLog(@"[PDDReplica] search input page not opened; keyword copied for manual recovery task=%@", taskID);
         return;
     }
 
-    BOOL focused = [target becomeFirstResponder];
-    if (!focused && !target.isFirstResponder) {
-        NSLog(@"[PDDReplica] search input did not become first responder class=%@", NSStringFromClass(target.class));
-        if (++gAutoSearchAttempts <= 45) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                PDDAutoSearchAttempt(taskID, keyword);
-            });
-        } else {
-            PDDAutoPause(@"搜尋輸入框無法取得焦點，未提交關鍵詞。");
-        }
+    if (![target becomeFirstResponder] && !target.isFirstResponder) {
+        NSLog(@"[PDDReplica] search field refused first responder task=%@ class=%@", taskID, NSStringFromClass(target.class));
+        UIPasteboard.generalPasteboard.string = keyword;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            PDDAutoSearchAttempt(taskID, keyword);
+        });
         return;
     }
-    UIPasteboard.generalPasteboard.string = keyword;
-    // Explicit replacement prevents the previous keyword from remaining or
-    // being partially selected when the next task starts.
+
+    // Replace, then verify after the app's text-field delegate has had time to run.
     target.text = @"";
     [target sendActionsForControlEvents:UIControlEventEditingChanged];
     target.text = keyword;
     [target sendActionsForControlEvents:UIControlEventEditingChanged];
-    [target sendActionsForControlEvents:UIControlEventValueChanged];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         NSDictionary *latest = PDDActiveTaskSnapshot();
         if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
-        if (!target.isFirstResponder || ![target.text isEqualToString:keyword]) {
-            NSLog(@"[PDDReplica] search input verification failed focus=%@ actual=%@ expected=%@",
-                  target.isFirstResponder ? @"YES" : @"NO", target.text ?: @"<nil>", keyword);
-            gAutoSearchSubmitted = NO;
-            if (++gAutoSearchAttempts <= 45) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString *actual = target.text ?: @"";
+        if (![actual isEqualToString:keyword]) {
+            NSLog(@"[PDDReplica] search keyword verification failed task=%@ expected=%@ actual=%@; refusing to submit", taskID, keyword, actual);
+            UIPasteboard.generalPasteboard.string = keyword;
+            // Retry only while the same task is active; do not submit an empty/partial term.
+            if (++gAutoSearchAttempts <= 5) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                     PDDAutoSearchAttempt(taskID, keyword);
                 });
-            } else {
-                PDDAutoPause(@"搜尋關鍵詞寫入後核對不一致，已停止提交以避免空白或錯誤搜尋。");
             }
             return;
         }
+        [target sendActionsForControlEvents:UIControlEventEditingChanged];
         UIButton *submit = buttons.firstObject;
         if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
         else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
         gAutoSearchSubmitted = YES;
         gAutoCollectState = 1;
         gAutoPhaseTicks = 0;
-        NSLog(@"[PDDReplica] auto search verified and submitted task=%@ keyword=%@", taskID, keyword);
+        NSLog(@"[PDDReplica] verified search keyword and submitted task=%@ keyword=%@", taskID, keyword);
         PDDAutoScheduleTick(1.0);
     });
+    return;
     return;
 }
 
@@ -1087,9 +1066,13 @@ static void PDDAutoCollectTick(void) {
     NSUInteger saved = [active[@"saved_count"] unsignedIntegerValue];
     if (target < 1) target = 1;
     if (target > 3) target = 3;
-    // Never short-circuit the final-upload return phase. State 4 must verify
-    // that the UI has returned to the results page before the task is released.
-    if (saved >= target && gAutoCollectState != 4) return;
+    // The final upload must still pass through state 4 so the detail page can
+    // return to results before the active task is released.
+    if (saved >= target && gAutoCollectState != 4) {
+        // If the server count is already complete but UI is still in detail,
+        // allow the existing return/upload confirmation path to finish.
+        if (gAutoCollectState != 3 && gAutoCollectState != 7) return;
+    }
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDAutoPause(@"找不到拼多多活動視窗。"); return; }
 
@@ -1174,7 +1157,7 @@ static void PDDAutoCollectTick(void) {
             if (gAutoTaskCompletedPendingReturn || saved >= target) {
                 NSString *finishedKeyword = [active[@"keyword"] isKindOfClass:NSString.class] ? active[@"keyword"] : @"";
                 NSUInteger finishedCount = saved;
-                PDDShowMessage(@"採集任務完成", [NSString stringWithFormat:@"%@\n成功上傳 %lu 件商品。", finishedKeyword, (unsigned long)finishedCount]);
+                NSLog(@"[PDDReplica] task complete keyword=%@ uploaded=%lu; results page confirmed, releasing task", finishedKeyword, (unsigned long)finishedCount);
                 PDDClearActiveTask();
                 return;
             }
