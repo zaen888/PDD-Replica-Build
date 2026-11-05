@@ -12,4 +12,4 @@
 @end
 
 #define PDDDiagLog(fmt, ...) [[PDDDiagnostics shared] log:fmt, ##__VA_ARGS__]
-#define PDDDiagEvent(name, fields) [[PDDDiagnostics shared] event:name fields:fields]
+#define PDDDiagEvent(name, ...) [[PDDDiagnostics shared] event:name fields:(__VA_ARGS__)]
