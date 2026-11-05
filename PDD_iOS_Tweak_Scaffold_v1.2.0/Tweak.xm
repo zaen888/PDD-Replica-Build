@@ -701,7 +701,19 @@ static void PDDCloudTick(void) {
                     });
                 }
             } else if (PDDActiveTaskSnapshot()) {
-                PDDClearActiveTask(); // server-side task was stopped or lease was released
+                // 安全修復：如果狀態機正在執行中，代表任務正在跑，此時伺服器回空不能清空！
+                if (gAutoCollectState == 1 || gAutoCollectState == 2 || gAutoCollectState == 3 || gAutoCollectState == 4 || gAutoCollectState == 7) {
+                    PDDDiagEvent(@"claim.empty_ignored", @{
+                        @"active": gActiveTaskID ?: @"",
+                        @"auto_state": @(gAutoCollectState)
+                    });
+                } else {
+                    PDDDiagEvent(@"claim.empty_cleared", @{
+                        @"active": gActiveTaskID ?: @"",
+                        @"auto_state": @(gAutoCollectState)
+                    });
+                    PDDClearActiveTask(); // 只有在待機狀態下才允許伺服器強制清空
+                }
             }
         });
     }
