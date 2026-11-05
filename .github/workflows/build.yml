@@ -8,24 +8,82 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container:
-      image: theos/theos:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Build
-        working-directory: PDD_iOS_Tweak_Scaffold_v1.2.0
+      - name: Install build deps
         run: |
-          make clean || true
-          # 直接使用完美環境編譯
-          make TARGET=iphone:clang:latest:14.0
+          sudo apt-get update
+          sudo apt-get install -y curl wget unzip clang lld xz-utils
+
+      - name: Download Dependencies
+        run: |
+          mkdir -p deps
+          cd deps
+          
+          echo "Downloading Logos..."
+          curl -sL --retry 3 -o logos.zip https://github.com/theos/logos/archive/refs/heads/master.zip
+          unzip -q logos.zip
+          
+          echo "Downloading Headers..."
+          curl -sL --retry 3 -o headers.zip https://github.com/theos/headers/archive/refs/heads/master.zip
+          unzip -q headers.zip
+          
+          echo "Downloading SDKs..."
+          curl -sL --retry 3 -o sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
+          unzip -q sdks.zip
+          
+          echo "Downloading ldid..."
+          curl -sL --retry 3 -o ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          chmod +x ldid
+
+      - name: Build Dylib
+        run: |
+          DEPS="$PWD/deps"
+          SDK_PATH="$DEPS/sdks-master/iPhoneOS15.6.sdk"
+          LOGOS_PL="$DEPS/logos-master/bin/logos.pl"
+          HEADERS="$DEPS/headers-master/include"
+
+          # 直接寫死進入 1.2.0 目錄
+          cd PDD_iOS_Tweak_Scaffold_v1.2.0
+          
+          echo "=== 目前目錄下的文件 ==="
+          ls -la
+
+          echo "=== Preprocessing Logos ==="
+          perl $LOGOS_PL Tweak.xm > Tweak.mm
+          if [ -f PDDInputHooks.xm ]; then
+            perl $LOGOS_PL PDDInputHooks.xm > PDDInputHooks.mm
+          fi
+
+          SOURCES="PDDDiagnostics.m Tweak.mm"
+          if [ -f PDDInputHooks.mm ]; then
+            SOURCES="$SOURCES PDDInputHooks.mm"
+          fi
+
+          echo "=== Compiling Dylib ==="
+          clang++ -dynamiclib \
+            -arch arm64 -arch arm64e \
+            -mios-version-min=14.0 \
+            -isysroot "$SDK_PATH" \
+            -F"$SDK_PATH/System/Library/Frameworks" \
+            -F"$SDK_PATH/System/Library/PrivateFrameworks" \
+            -I"$HEADERS" \
+            -framework Foundation -framework UIKit -framework CoreFoundation \
+            -lz -Wl,-undefined,dynamic_lookup \
+            -fobjc-arc -fmodules -fblocks -DTHEOS_PACKAGE_NAME=\"com.local.pddreplicashell\" \
+            $SOURCES \
+            -o PDDReplicaShell.dylib
+
+          echo "=== Signing Dylib ==="
+          $DEPS/ldid -S PDDReplicaShell.dylib
+          mv PDDReplicaShell.dylib $GITHUB_WORKSPACE/
+          ls -la $GITHUB_WORKSPACE/PDDReplicaShell.dylib
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PDDReplicaShell-dylib
-          path: PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
+          path: PDDReplicaShell.dylib
           if-no-files-found: warn
