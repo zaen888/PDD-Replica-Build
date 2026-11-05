@@ -328,73 +328,7 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons);
 }
 
-static UIView *PDDFindSearchEntry(UIView *view) {
-    if (!view || view.hidden || view.alpha < 0.05 || CGRectIsEmpty(view.bounds)) return nil;
-
-    // Pinduoduo iOS 6.92.0 home diagnostic: the actual search entry is
-    // a custom PDDSearchBarInputField UIView with a UITapGestureRecognizer.
-    if ([NSStringFromClass(view.class) isEqualToString:@"PDDSearchBarInputField"] &&
-        view.isUserInteractionEnabled && view.gestureRecognizers.count > 0) {
-        return view;
-    }
-
-    if ([view isKindOfClass:UIControl.class]) {
-        NSString *title = [view isKindOfClass:UIButton.class] ? [(UIButton *)view titleForState:UIControlStateNormal] : @"";
-        NSString *label = view.accessibilityLabel ?: @"";
-        NSString *identifier = view.accessibilityIdentifier ?: @"";
-        if (PDDStringLooksLikeSearch(title) || PDDStringLooksLikeSearch(label) || PDDStringLooksLikeSearch(identifier)) return view;
-    }
-    NSString *label = view.accessibilityLabel ?: @"";
-    NSString *identifier = view.accessibilityIdentifier ?: @"";
-    if ((PDDStringLooksLikeSearch(label) || PDDStringLooksLikeSearch(identifier)) &&
-        (view.isUserInteractionEnabled || view.gestureRecognizers.count > 0)) return view;
-    for (UIView *child in view.subviews) {
-        UIView *found = PDDFindSearchEntry(child);
-        if (found) return found;
-    }
-    return nil;
-}
-
-static void PDDActivateSearchEntry(UIView *entry) {
-    if (!entry) return;
-    if ([entry isKindOfClass:UIControl.class]) {
-        [(UIControl *)entry sendActionsForControlEvents:UIControlEventTouchUpInside];
-        return;
-    }
-    if ([entry respondsToSelector:@selector(accessibilityActivate)]) {
-        BOOL activated = ((BOOL (*)(id, SEL))objc_msgSend)(entry, @selector(accessibilityActivate));
-        if (activated) return;
-    }
-
-    // The diagnosed PDDSearchBarInputField is a custom UIView, not a UIButton.
-    // Invoke only its own PDD tap-gesture target/action; do not synthesize screen taps.
-    for (UIGestureRecognizer *gesture in entry.gestureRecognizers ?: @[]) {
-        if (![gesture isKindOfClass:UITapGestureRecognizer.class] || !gesture.enabled) continue;
-        NSArray *targets = nil;
-        @try { targets = [gesture valueForKey:@"_targets"]; } @catch (__unused NSException *e) {}
-        for (id targetRecord in targets ?: @[]) {
-            id target = nil;
-            SEL action = NULL;
-            @try {
-                target = [targetRecord valueForKey:@"target"];
-                id actionValue = [targetRecord valueForKey:@"action"];
-                if ([actionValue isKindOfClass:NSString.class]) action = NSSelectorFromString(actionValue);
-                else if ([actionValue respondsToSelector:@selector(pointerValue)]) action = (SEL)[actionValue pointerValue];
-            } @catch (__unused NSException *e) {}
-            if (!target || !action || ![target respondsToSelector:action]) continue;
-            NSString *targetClass = NSStringFromClass([target class]);
-            if (![targetClass containsString:@"PDDSearchBarInputField"]) continue;
-            NSMethodSignature *sig = [target methodSignatureForSelector:action];
-            if (sig.numberOfArguments >= 3) {
-                ((void (*)(id, SEL, id))objc_msgSend)(target, action, gesture);
-            } else {
-                ((void (*)(id, SEL))objc_msgSend)(target, action);
-            }
-            NSLog(@"[PDDReplica] activated diagnosed search tap action %@ on %@", NSStringFromSelector(action), targetClass);
-            return;
-        }
-    }
-}
+// Home-page search activation is intentionally removed: workflow starts on search page.
 
 static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     if (!PDDCaptureEnabled() || !taskID.length || !keyword.length) return;
