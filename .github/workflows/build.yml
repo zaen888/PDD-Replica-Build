@@ -20,20 +20,19 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang llvm lld
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
+          
+          # 使用官方推薦的安裝方式
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          
+          # 安裝 ldid
           mkdir -p $THEOS/bin
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
-          
-          # 建立 clang 鏈接，絕對不要建 ld 的鏈接！
-          mkdir -p $THEOS/toolchain/linux/iphone/bin
-          ln -sf $(which clang) $THEOS/toolchain/linux/iphone/bin/clang
-          ln -sf $(which clang++) $THEOS/toolchain/linux/iphone/bin/clang++
           
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
@@ -49,13 +48,12 @@ jobs:
           mv iPhoneOS15.6.sdk $THEOS/sdks/
           cd $GITHUB_WORKSPACE
           rm -rf /tmp/sdks
-          
-          ls -la $THEOS/sdks
 
       - name: Build
         run: |
           make clean || true
-          make package
+          # 關鍵：明確指定使用 clang 作為連結器，避開系統 ld
+          make package TARGET=iphone:clang:latest:14.0 LDFLAGS="-fuse-ld=clang"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
