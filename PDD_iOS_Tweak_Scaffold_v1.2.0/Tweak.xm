@@ -345,13 +345,11 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         return;
     }
 
-    // 延遲清空，再寫入，給 UIKit 一點時間同步內部狀態
     target.text = @"";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         target.text = keyword;
         [target sendActionsForControlEvents:UIControlEventEditingChanged];
         
-        // 延遲 0.8 秒後驗證，若被清空則重試一次
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             NSDictionary *latest = PDDActiveTaskSnapshot();
             if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
@@ -360,7 +358,6 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
             if (![actual isEqualToString:keyword]) {
                 PDDDiagEvent(@"search.verify_failed", @{@"expected": keyword, @"actual": actual});
                 
-                // 強制再寫一次
                 target.text = keyword;
                 [target sendActionsForControlEvents:UIControlEventEditingChanged];
                 
@@ -637,7 +634,6 @@ static void PDDCloudTick(void) {
             if (task) {
                 PDDSetActiveTask(task, YES);
             } else if (PDDActiveTaskSnapshot()) {
-                // 防護：只有明確處於待機(0)或暫停(6)時，才允許伺服器因空任務而清空本地
                 if (gAutoCollectState == 0 || gAutoCollectState == 6) {
                     PDDClearActiveTask();
                 } else {
@@ -718,13 +714,13 @@ static void PDDConfigureCloud(void) {
     });
 }
 
-static BOOL PDDClassImplementsSelector(id object, SEL selector) {
+__attribute__((unused)) static BOOL PDDClassImplementsSelector(id object, SEL selector) {
     if (!object || !selector) return NO;
     return class_getInstanceMethod(object_getClass(object), selector) != NULL ||
            class_getInstanceMethod([object class], selector) != NULL;
 }
 
-static NSString *PDDGestureTargetSummary(UIGestureRecognizer *gesture) {
+__attribute__((unused)) static NSString *PDDGestureTargetSummary(UIGestureRecognizer *gesture) {
     NSMutableArray *parts = [NSMutableArray array];
     @try {
         id targets = [gesture valueForKey:@"_targets"];
@@ -879,10 +875,7 @@ static void PDDAutoCollectTick(void) {
         gAutoCollectState = 0; return;
     }
     
-    // 修正：如果 active_task_id 與 gAutoSearchTaskID 不匹配，不要直接設為 0，而是等待 assign
     if (![active[@"task_id"] isEqualToString:gAutoSearchTaskID]) {
-        // 這是因為 PDDSetActiveTask 才剛把 active_task_id 換成新的，但非同步的 PDDStartAutoSearchForTask 還沒跑完
-        // 我們只需要重新調度一次，不要殺死狀態
         if (gAutoCollectState != 0) {
             PDDAutoScheduleTick(0.5);
         }
