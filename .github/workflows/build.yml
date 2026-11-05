@@ -22,17 +22,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip wget
 
-      - name: Setup Theos
+      - name: Setup Theos & Toolchain
         run: |
           export THEOS=$HOME/theos
-          git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
+          git clone --depth 1 https://github.com/theos/theos.git $THEOS
           
-          # 安裝 ldid
+          # 只拉取必需的子模組，避開無限的網路超時 (exit code 8)
+          cd $THEOS
+          git submodule update --init --recursive --depth 1 vendor/dm.pl vendor/include vendor/lib vendor/logos
+          cd - > /dev/null
+          
           mkdir -p $THEOS/bin
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
           
-          # 下載並解壓 Theos 官方 Linux 專用工具鏈（自帶 libc++，完美解決 std 模組報錯）
+          # 下載 Theos 官方 Linux 專用工具鏈（完美解決 std 和 libc++ 找不到的問題）
           wget -q https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz -O /tmp/toolchain.tar.xz
           mkdir -p $THEOS/toolchain/linux
           tar -xJf /tmp/toolchain.tar.xz -C $THEOS/toolchain/linux --strip-components=1
@@ -51,7 +55,7 @@ jobs:
       - name: Build
         run: |
           make clean || true
-          # 使用 Theos 自帶的工具鏈編譯
+          # 直接編譯 dylib，跳過 deb 打包
           make TARGET=iphone:clang:latest:14.0
 
       - name: Upload artifacts
