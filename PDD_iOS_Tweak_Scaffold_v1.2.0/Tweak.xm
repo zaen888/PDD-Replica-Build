@@ -30,17 +30,12 @@ static BOOL gUploadBusy = NO;
 static NSString *gAutoSearchTaskID = nil;
 static NSUInteger gAutoSearchAttempts = 0;
 static BOOL gAutoSearchSubmitted = NO;
-// 1.2.4 sequential collector state. 0=idle, 1=waiting results, 2=selecting card,
-// 3=waiting server-confirmed upload, 4=returning, 5=3-second spacing, 6=paused,
-// 7=waiting for the selected card to open its detail page.
 static NSInteger gAutoCollectState = 0;
 static NSMutableSet<NSString *> *gAutoVisitedIndexPaths = nil;
 static NSString *gAutoExpectedGoodsID = nil;
 static NSUInteger gAutoScrollAttempts = 0;
 static NSUInteger gAutoPhaseTicks = 0;
 static BOOL gAutoTickScheduled = NO;
-// Server may mark the task complete on the last upload before the UI has returned.
-// Defer clearing task state until the detail->results transition is confirmed.
 static BOOL gAutoTaskCompletedPendingReturn = NO;
 
 static NSString *PDDDataDirectory(void);
@@ -82,28 +77,18 @@ static BOOL PDDLooksLikeGoodsObject(id object, NSString **goodsIDOut) {
 
 static void PDDCaptureRawJSON(NSData *data, NSString *goodsID) {
     if (data.length == 0 || !goodsID.length) return;
-    // Bind a capture to the task that was active when the parser returned.
-    // This prevents a queued disk write from being attached to a later task.
     NSDictionary *taskSnapshot = PDDActiveTaskSnapshot();
-    // During a cloud task, associate uploads only with JSON observed after a
-    // product-card selection has started; do not turn search-list payloads into task captures.
     if (taskSnapshot && gAutoCollectState != 2 && gAutoCollectState != 3 && gAutoCollectState != 7) taskSnapshot = nil;
     NSData *snapshot = [data copy];
     dispatch_async(gCaptureQueue, ^{
         NSFileManager *fm = NSFileManager.defaultManager;
         NSString *dir = PDDDataDirectory();
         NSError *error = nil;
-        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&error]) {
-            NSLog(@"[PDDReplica] create directory failed: %@", error.localizedDescription);
-            return;
-        }
+        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&error]) return;
         NSString *path = [dir stringByAppendingPathComponent:[goodsID stringByAppendingPathExtension:@"txt"]];
-        if (![snapshot writeToFile:path options:NSDataWritingAtomic error:&error]) {
-            NSLog(@"[PDDReplica] write failed for %@: %@", goodsID, error.localizedDescription);
-            return;
-        }
+        if (![snapshot writeToFile:path options:NSDataWritingAtomic error:&error]) return;
         @synchronized ([UIApplication class]) { gCaptureCount++; }
-        NSLog(@"[PDDReplica] saved product JSON id=%@ bytes=%lu", goodsID, (unsigned long)snapshot.length);
+        PDDDiagEvent(@"capture.saved", @{@"goods_id": goodsID, @"bytes": @(snapshot.length)});
         PDDQueueCloudUpload(snapshot, goodsID, taskSnapshot);
     });
 }
@@ -171,7 +156,6 @@ static void PDDAppendLE32(NSMutableData *data, uint32_t value) {
     [data appendBytes:b length:sizeof(b)];
 }
 
-// Minimal ZIP writer using STORE (no compression), compatible with standard ZIP readers.
 static NSURL *PDDCreateZIP(NSArray<NSURL *> *files, NSError **outError) {
     NSMutableData *zip = [NSMutableData data];
     NSMutableArray<NSDictionary *> *central = [NSMutableArray array];
@@ -185,7 +169,6 @@ static NSURL *PDDCreateZIP(NSArray<NSURL *> *files, NSError **outError) {
             if (outError) *outError = [NSError errorWithDomain:@"PDDReplicaZIP" code:1 userInfo:@{NSLocalizedDescriptionKey:@"檔名或檔案大小超出 ZIP Store 支援範圍。"}];
             return nil;
         }
-        // ZIP names are flattened like the original export; reject collisions rather than silently duplicate entries.
         for (NSDictionary *entry in central) {
             if ([entry[@"name"] isEqualToString:name]) {
                 if (outError) *outError = [NSError errorWithDomain:@"PDDReplicaZIP" code:2 userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"發現重複檔名：%@。請先整理檔案。", name]}];
@@ -223,7 +206,6 @@ static NSURL *PDDCreateZIP(NSArray<NSURL *> *files, NSError **outError) {
     PDDAppendLE32(zip, 0x06054b50); PDDAppendLE16(zip, 0); PDDAppendLE16(zip, 0);
     PDDAppendLE16(zip, (uint16_t)central.count); PDDAppendLE16(zip, (uint16_t)central.count);
     PDDAppendLE32(zip, centralSize); PDDAppendLE32(zip, centralOffset); PDDAppendLE16(zip, 0);
-
     NSString *tmp = NSTemporaryDirectory();
     NSString *uniqueName = [NSString stringWithFormat:@"PDDExport-%lu-%@.zip", (unsigned long)files.count, NSUUID.UUID.UUIDString];
     NSString *zipPath = [tmp stringByAppendingPathComponent:uniqueName];
@@ -233,7 +215,6 @@ static NSURL *PDDCreateZIP(NSArray<NSURL *> *files, NSError **outError) {
 }
 
 static void PDDShareTXTFiles(void) {
-    // File enumeration, reading, CRC calculation and ZIP construction run off the main thread.
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         NSArray<NSURL *> *files = PDDTXTFiles();
         if (files.count == 0) {
@@ -269,9 +250,6 @@ static void PDDShareTXTFiles(void) {
 - (void)cloudTick:(NSTimer *)timer;
 @end
 
-// MARK: - Local cloud worker (LAN server)
-// 1.2.0 development branch: task communication and capture/upload remain the stable core.
-// Search/navigation must be validated against the actual Pinduoduo UI before being enabled.
 static NSString *PDDCloudSetting(NSString *key) {
     id value = [NSUserDefaults.standardUserDefaults objectForKey:key];
     return [value isKindOfClass:NSString.class] ? [(NSString *)value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : @"";
@@ -295,9 +273,6 @@ static NSDictionary *PDDActiveTaskSnapshot(void) {
     }
 }
 
-// MARK: - Conservative UIKit search adapter (1.2.0 dev)
-// It only operates on controls whose accessibility metadata identifies them as search controls.
-// It deliberately does not tap arbitrary text fields or product cells.
 static BOOL PDDStringLooksLikeSearch(NSString *value) {
     if (![value isKindOfClass:NSString.class] || value.length == 0) return NO;
     NSString *v = value.lowercaseString;
@@ -316,8 +291,6 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     if ([view isKindOfClass:UITextField.class]) {
         UITextField *field = (UITextField *)view;
         BOOL identified = PDDStringLooksLikeSearch(field.placeholder) || PDDStringLooksLikeSearch(field.accessibilityLabel) || PDDStringLooksLikeSearch(field.accessibilityIdentifier);
-        // Search pages in this app version may expose an editable field without
-        // any searchable accessibility text. Keep it as a fallback candidate.
         if ((identified || field.enabled) && ![fields containsObject:field]) [fields addObject:field];
     }
     if ([view isKindOfClass:UIButton.class]) {
@@ -328,8 +301,6 @@ static void PDDCollectSearchControls(UIView *view, NSMutableArray<UITextField *>
     }
     for (UIView *child in view.subviews) PDDCollectSearchControls(child, fields, buttons);
 }
-
-// Home-page search activation is intentionally removed: workflow starts on search page.
 
 static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     if (!PDDCaptureEnabled() || !taskID.length || !keyword.length) return;
@@ -356,24 +327,17 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
     }
     if (!target && fields.count == 1) target = fields.firstObject;
     if (!target) {
-        // User workflow: they manually navigate to Pinduoduo's search input page.
-        // Never activate the home-page search entry from this automation.
         if (++gAutoSearchAttempts <= 180) {
-            if (gAutoSearchAttempts == 1 || gAutoSearchAttempts % 15 == 0) {
-                NSLog(@"[PDDReplica] waiting for user to open search input page task=%@ attempt=%lu", taskID, (unsigned long)gAutoSearchAttempts);
-            }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 PDDAutoSearchAttempt(taskID, keyword);
             });
             return;
         }
         UIPasteboard.generalPasteboard.string = keyword;
-        NSLog(@"[PDDReplica] search input page not opened; keyword copied for manual recovery task=%@", taskID);
         return;
     }
 
     if (![target becomeFirstResponder] && !target.isFirstResponder) {
-        NSLog(@"[PDDReplica] search field refused first responder task=%@ class=%@", taskID, NSStringFromClass(target.class));
         UIPasteboard.generalPasteboard.string = keyword;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             PDDAutoSearchAttempt(taskID, keyword);
@@ -381,38 +345,47 @@ static void PDDAutoSearchAttempt(NSString *taskID, NSString *keyword) {
         return;
     }
 
-    // Replace, then verify after the app's text-field delegate has had time to run.
+    // 延遲清空，再寫入，給 UIKit 一點時間同步內部狀態
     target.text = @"";
-    [target sendActionsForControlEvents:UIControlEventEditingChanged];
-    target.text = keyword;
-    [target sendActionsForControlEvents:UIControlEventEditingChanged];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        NSDictionary *latest = PDDActiveTaskSnapshot();
-        if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
-        NSString *actual = target.text ?: @"";
-        if (![actual isEqualToString:keyword]) {
-            NSLog(@"[PDDReplica] search keyword verification failed task=%@ expected=%@ actual=%@; refusing to submit", taskID, keyword, actual);
-            UIPasteboard.generalPasteboard.string = keyword;
-            // Retry only while the same task is active; do not submit an empty/partial term.
-            if (++gAutoSearchAttempts <= 5) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    PDDAutoSearchAttempt(taskID, keyword);
-                });
-            }
-            return;
-        }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        target.text = keyword;
         [target sendActionsForControlEvents:UIControlEventEditingChanged];
-        UIButton *submit = buttons.firstObject;
-        if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
-        else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
-        gAutoSearchSubmitted = YES;
-        gAutoCollectState = 1;
-        gAutoPhaseTicks = 0;
-        NSLog(@"[PDDReplica] verified search keyword and submitted task=%@ keyword=%@", taskID, keyword);
-        PDDAutoScheduleTick(1.0);
+        
+        // 延遲 0.8 秒後驗證，若被清空則重試一次
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSDictionary *latest = PDDActiveTaskSnapshot();
+            if (![latest[@"task_id"] isEqualToString:taskID] || !target.window) return;
+            
+            NSString *actual = target.text ?: @"";
+            if (![actual isEqualToString:keyword]) {
+                PDDDiagEvent(@"search.verify_failed", @{@"expected": keyword, @"actual": actual});
+                
+                // 強制再寫一次
+                target.text = keyword;
+                [target sendActionsForControlEvents:UIControlEventEditingChanged];
+                
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    UIButton *submit = buttons.firstObject;
+                    if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+                    else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+                    gAutoSearchSubmitted = YES;
+                    gAutoCollectState = 1;
+                    gAutoPhaseTicks = 0;
+                    PDDDiagEvent(@"search.submitted_force", @{@"keyword": keyword});
+                    PDDAutoScheduleTick(1.0);
+                });
+            } else {
+                UIButton *submit = buttons.firstObject;
+                if (submit && submit.enabled) [submit sendActionsForControlEvents:UIControlEventTouchUpInside];
+                else [target sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
+                gAutoSearchSubmitted = YES;
+                gAutoCollectState = 1;
+                gAutoPhaseTicks = 0;
+                PDDDiagEvent(@"search.submitted", @{@"keyword": keyword});
+                PDDAutoScheduleTick(1.0);
+            }
+        });
     });
-    return;
-    return;
 }
 
 static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
@@ -427,7 +400,6 @@ static void PDDStartAutoSearchForTask(NSString *taskID, NSString *keyword) {
     gAutoPhaseTicks = 0;
     gAutoVisitedIndexPaths = [NSMutableSet set];
     UIPasteboard.generalPasteboard.string = keyword;
-    // First attempt is delayed to allow the task notification/UI transition to settle.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         PDDAutoSearchAttempt(taskID, keyword);
     });
@@ -453,11 +425,8 @@ static BOOL PDDSetActiveTask(NSDictionary *task, BOOL notify) {
             [button setTitle:title forState:UIControlStateNormal];
         }
         if (notify && isNew) {
-            // Do not present a modal alert here: it blocks touches and can cover
-            // the PDDSearchBarInputField while the automation is trying to open it.
             PDDStartAutoSearchForTask(taskID, keyword);
-            NSLog(@"[PDDReplica] received task %@ keyword=%@ target=%lu; automation started without modal alert",
-                  taskID, keyword, (unsigned long)MIN(MAX(gActiveTargetCount, 1), 3));
+            PDDDiagEvent(@"task.received", @{@"task_id": taskID, @"keyword": keyword});
         }
     });
     return isNew;
@@ -540,10 +509,9 @@ static BOOL PDDQuarantinePendingUpload(NSString *path, NSString *reason) {
     if ([fm moveItemAtPath:path toPath:destination error:&moveError]) {
         NSString *note = reason.length ? reason : @"上傳遭伺服器拒絕；原始佇列檔已保留在 FailedUploads。";
         [note writeToFile:[destination stringByAppendingString:@".reason.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"[PDDReplica] upload quarantined file=%@ reason=%@", destination.lastPathComponent, note);
+        PDDDiagEvent(@"upload.quarantined", @{@"file": destination.lastPathComponent, @"reason": note});
         return YES;
     }
-    NSLog(@"[PDDReplica] could not quarantine upload %@: %@", path, moveError.localizedDescription ?: @"");
     return NO;
 }
 
@@ -559,31 +527,12 @@ static void PDDHandleUploadSuccess(NSDictionary *envelope, NSDictionary *respons
     NSString *uploadedGoodsID = [envelope[@"goods_id"] isKindOfClass:NSString.class] ? envelope[@"goods_id"] : nil;
     if (uploadedGoodsID.length) PDDAutoUploadConfirmed(uploadedGoodsID);
     if (completed) {
-        // Do NOT clear the active task here: PDDAutoUploadConfirmed still needs its
-        // task/state context to return from the detail page. Clearing here used to
-        // cancel the return tick and strand the app on the final product.
         gAutoTaskCompletedPendingReturn = YES;
-        NSLog(@"[PDDReplica] server marked task complete; defer clearing until search page is confirmed task=%@", taskID);
     } else {
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *window = PDDActiveWindow(); UIButton *button = (UIButton *)[window viewWithTag:kFloatingButtonTag];
             if ([button isKindOfClass:UIButton.class]) [button setTitle:[NSString stringWithFormat:@"PDD · %lu/%lu", (unsigned long)saved, (unsigned long)gActiveTargetCount] forState:UIControlStateNormal];
         });
-    }
-}
-
-static void PDDDiscardPendingForTask(NSString *taskID) {
-    if (!taskID.length) return;
-    NSString *dir = PDDPendingUploadDirectory();
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-    for (NSString *name in files) {
-        if (![name.pathExtension.lowercaseString isEqualToString:@"json"]) continue;
-        NSString *path = [dir stringByAppendingPathComponent:name];
-        NSData *data = [NSData dataWithContentsOfFile:path];
-        id parsed = data ? [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil] : nil;
-        if ([parsed isKindOfClass:NSDictionary.class] && [parsed[@"task_id"] isEqualToString:taskID]) {
-            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
-        }
     }
 }
 
@@ -609,9 +558,8 @@ static void PDDFlushPendingUploads(void) {
             }
             if (![envelope isKindOfClass:NSDictionary.class] || ![envelope[@"task_id"] isKindOfClass:NSString.class] ||
                 ![envelope[@"goods_id"] isKindOfClass:NSString.class] || ![envelope[@"raw_json_base64"] isKindOfClass:NSString.class]) {
-                BOOL moved = PDDQuarantinePendingUpload(path, @"上傳佇列 JSON 格式錯誤；檔案已移至 FailedUploads。");
+                PDDQuarantinePendingUpload(path, @"上傳佇列 JSON 格式錯誤；檔案已移至 FailedUploads。");
                 @synchronized ([UIApplication class]) { gUploadBusy = NO; [gUploadingPaths removeObject:path]; }
-                if (moved) PDDFlushPendingUploads();
                 return;
             }
             PDDCloudRequest(@"/api/v1/device/captures", envelope, ^(NSDictionary *result, NSError *error, NSInteger statusCode) {
@@ -620,26 +568,23 @@ static void PDDFlushPendingUploads(void) {
                 if (success) {
                     [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
                     PDDHandleUploadSuccess(envelope, result);
-                    NSLog(@"[PDDReplica] cloud upload accepted goods_id=%@ task_id=%@", envelope[@"goods_id"], envelope[@"task_id"]);
-                    if (completed) PDDDiscardPendingForTask(envelope[@"task_id"]);
                 } else {
                     BOOL retryable = (statusCode == 0 || statusCode >= 500 || statusCode == 408 || statusCode == 425 || statusCode == 429);
                     if (!retryable && statusCode >= 400 && statusCode < 500) {
                         NSString *detail = [result[@"detail"] isKindOfClass:NSString.class] ? result[@"detail"] : @"伺服器拒絕此上傳";
                         PDDQuarantinePendingUpload(path, [NSString stringWithFormat:@"HTTP %ld：%@", (long)statusCode, detail]);
                     }
-                    NSLog(@"[PDDReplica] cloud upload %@ goods_id=%@ status=%ld error=%@", retryable ? @"pending" : @"rejected", envelope[@"goods_id"], (long)statusCode, error.localizedDescription ?: @"");
                 }
                 @synchronized ([UIApplication class]) { gUploadBusy = NO; [gUploadingPaths removeObject:path]; }
                 if (success && !completed) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ PDDFlushPendingUploads(); });
             });
         });
-        return; // one in-flight upload keeps task target counting deterministic
+        return;
     }
 }
 
 static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *task) {
-    if (!task || !data.length || !goodsID.length) return; // no task: preserve the original local-only capture behavior
+    if (!task || !data.length || !goodsID.length) return;
     dispatch_async(gCaptureQueue, ^{
         NSString *dir = PDDPendingUploadDirectory();
         [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -672,17 +617,14 @@ static void PDDCloudTick(void) {
                 gHeartbeatInFlight = NO;
                 gLastHeartbeat = [NSDate date].timeIntervalSince1970;
             });
-            if (error || statusCode < 200 || statusCode >= 300) NSLog(@"[PDDReplica] heartbeat failed status=%ld %@", (long)statusCode, error.localizedDescription ?: @"");
         });
     }
     if (PDDCaptureEnabled() && !gClaimInFlight) {
         gClaimInFlight = YES;
         PDDCloudRequest(@"/api/v1/device/tasks/claim", @{}, ^(NSDictionary *result, NSError *error, NSInteger statusCode) {
             dispatch_async(dispatch_get_main_queue(), ^{ gClaimInFlight = NO; });
-            if (error || statusCode < 200 || statusCode >= 300) {
-                NSLog(@"[PDDReplica] task claim failed status=%ld %@", (long)statusCode, error.localizedDescription ?: @"");
-                return;
-            }
+            if (error || statusCode < 200 || statusCode >= 300) return;
+            
             PDDDiagEvent(@"claim.response", @{
                 @"status": @(statusCode),
                 @"paused": result[@"paused"] ?: @NO,
@@ -693,26 +635,16 @@ static void PDDCloudTick(void) {
             if ([result[@"paused"] boolValue]) return;
             NSDictionary *task = [result[@"task"] isKindOfClass:NSDictionary.class] ? result[@"task"] : nil;
             if (task) {
-                BOOL isNewTask = PDDSetActiveTask(task, YES);
-                if (isNewTask) {
-                    NSString *taskID = task[@"task_id"];
-                    PDDCloudRequest([NSString stringWithFormat:@"/api/v1/device/tasks/%@/start", taskID], @{}, ^(NSDictionary *r, NSError *e, NSInteger code) {
-                        if (e || code < 200 || code >= 300) NSLog(@"[PDDReplica] task start failed task=%@ status=%ld", taskID, (long)code);
-                    });
-                }
+                PDDSetActiveTask(task, YES);
             } else if (PDDActiveTaskSnapshot()) {
-                // 安全修復：如果狀態機正在執行中，代表任務正在跑，此時伺服器回空不能清空！
-                if (gAutoCollectState == 1 || gAutoCollectState == 2 || gAutoCollectState == 3 || gAutoCollectState == 4 || gAutoCollectState == 7) {
+                // 防護：只有明確處於待機(0)或暫停(6)時，才允許伺服器因空任務而清空本地
+                if (gAutoCollectState == 0 || gAutoCollectState == 6) {
+                    PDDClearActiveTask();
+                } else {
                     PDDDiagEvent(@"claim.empty_ignored", @{
                         @"active": gActiveTaskID ?: @"",
                         @"auto_state": @(gAutoCollectState)
                     });
-                } else {
-                    PDDDiagEvent(@"claim.empty_cleared", @{
-                        @"active": gActiveTaskID ?: @"",
-                        @"auto_state": @(gAutoCollectState)
-                    });
-                    PDDClearActiveTask(); // 只有在待機狀態下才允許伺服器強制清空
                 }
             }
         });
@@ -721,10 +653,7 @@ static void PDDCloudTick(void) {
 }
 
 static void PDDStartCloudWorker(void) {
-    if (!PDDCloudConfigured()) {
-        NSLog(@"[PDDReplica] local cloud connection is not configured; open the floating-button menu to set it.");
-        return;
-    }
+    if (!PDDCloudConfigured()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (gCloudTimer) { [gCloudTimer invalidate]; gCloudTimer = nil; }
         gCloudTimer = [NSTimer scheduledTimerWithTimeInterval:kCloudPollInterval target:[PDDActionProxy shared] selector:@selector(cloudTick:) userInfo:nil repeats:YES];
@@ -797,8 +726,6 @@ static BOOL PDDClassImplementsSelector(id object, SEL selector) {
 
 static NSString *PDDGestureTargetSummary(UIGestureRecognizer *gesture) {
     NSMutableArray *parts = [NSMutableArray array];
-    // UIKit keeps target/action pairs in a private array. Read defensively and
-    // report only class/selector names; never invoke private actions.
     @try {
         id targets = [gesture valueForKey:@"_targets"];
         if ([targets isKindOfClass:NSArray.class]) {
@@ -817,67 +744,6 @@ static NSString *PDDGestureTargetSummary(UIGestureRecognizer *gesture) {
         }
     } @catch (__unused NSException *e) {}
     return parts.count ? [parts componentsJoinedByString:@","] : @"target/action unavailable";
-}
-
-static void PDDAppendClickPathDiagnostics(UIView *view, NSMutableString *out, NSUInteger depth, NSUInteger *count) {
-    if (!view || depth > 18 || *count >= 180 || view.hidden || view.alpha < 0.05) return;
-    (*count)++;
-    NSString *className = NSStringFromClass(view.class);
-    CGRect frame = [view convertRect:view.bounds toView:PDDActiveWindow()];
-    NSString *label = view.accessibilityLabel ?: @"";
-    BOOL isGoodsCell = [className containsString:@"GoodsCell"] || [className containsString:@"GoodsItem"];
-    BOOL isSearch = [className containsString:@"SearchPage"];
-    BOOL isCollection = [view isKindOfClass:UICollectionView.class];
-    if (isGoodsCell || isSearch || isCollection) {
-        [out appendFormat:@"%@%@ frame=(%.0f,%.0f,%.0f,%.0f) label=%@\n",
-         [@"                                    " substringToIndex:MIN(depth * 2, (NSUInteger)36)], className,
-         frame.origin.x, frame.origin.y, frame.size.width, frame.size.height, label];
-    }
-    if ([view isKindOfClass:UICollectionView.class]) {
-        UICollectionView *cv = (UICollectionView *)view;
-        id delegate = cv.delegate; id dataSource = cv.dataSource;
-        [out appendFormat:@"%@COLLECTION delegate=%@ dataSource=%@ visible=%lu\n",
-         [@"                                    " substringToIndex:MIN((depth + 1) * 2, (NSUInteger)36)],
-         delegate ? NSStringFromClass([delegate class]) : @"nil",
-         dataSource ? NSStringFromClass([dataSource class]) : @"nil", (unsigned long)cv.indexPathsForVisibleItems.count];
-        NSArray *selectors = @[@"collectionView:didSelectItemAtIndexPath:", @"collectionView:shouldSelectItemAtIndexPath:", @"collectionView:willSelectItemAtIndexPath:"];
-        for (NSString *name in selectors) {
-            SEL sel = NSSelectorFromString(name);
-            [out appendFormat:@"%@delegate %@ = %@\n",
-             [@"                                    " substringToIndex:MIN((depth + 2) * 2, (NSUInteger)36)], name,
-             (delegate && PDDClassImplementsSelector(delegate, sel)) ? @"YES" : @"NO"];
-        }
-        for (NSIndexPath *indexPath in cv.indexPathsForVisibleItems) {
-            UICollectionViewCell *cell = [cv cellForItemAtIndexPath:indexPath];
-            if (!cell) continue;
-            NSMutableArray *titles = [NSMutableArray array];
-            NSMutableArray *stack = [NSMutableArray arrayWithObject:cell];
-            while (stack.count && titles.count < 4) {
-                UIView *node = stack.lastObject; [stack removeLastObject];
-                if (node.accessibilityLabel.length) [titles addObject:node.accessibilityLabel];
-                for (UIView *child in node.subviews) [stack addObject:child];
-            }
-            [out appendFormat:@"%@VISIBLE_CELL indexPath=%@ class=%@ frame=(%.0f,%.0f,%.0f,%.0f) labels=%@\n",
-             [@"                                    " substringToIndex:MIN((depth + 2) * 2, (NSUInteger)36)], indexPath,
-             NSStringFromClass(cell.class), cell.frame.origin.x, cell.frame.origin.y, cell.frame.size.width, cell.frame.size.height,
-             titles.count ? [titles componentsJoinedByString:@" | "] : @"none"];
-        }
-    }
-    if (isGoodsCell) {
-        for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
-            [out appendFormat:@"%@CELL_GESTURE class=%@ state=%ld enabled=%@ targets=%@\n",
-             [@"                                    " substringToIndex:MIN((depth + 1) * 2, (NSUInteger)36)],
-             NSStringFromClass(gesture.class), (long)gesture.state, gesture.enabled ? @"YES" : @"NO", PDDGestureTargetSummary(gesture)];
-        }
-    }
-    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
-        if (isSearch && gesture) {
-            [out appendFormat:@"%@VIEW_GESTURE owner=%@ class=%@ targets=%@\n",
-             [@"                                    " substringToIndex:MIN((depth + 1) * 2, (NSUInteger)36)],
-             className, NSStringFromClass(gesture.class), PDDGestureTargetSummary(gesture)];
-        }
-    }
-    for (UIView *child in view.subviews) PDDAppendClickPathDiagnostics(child, out, depth + 1, count);
 }
 
 static BOOL PDDFindTestCollection(UIView *view, UICollectionView **collectionOut, NSIndexPath **indexPathOut, NSString **reasonOut) {
@@ -927,8 +793,6 @@ static UIButton *PDDFindDetailBackButton(UIView *view) {
     if ([view isKindOfClass:UIButton.class]) {
         UIButton *button = (UIButton *)view;
         if (button.enabled) {
-            // Prefer the exact action found in DIAG1:
-            // PDDGoodsDetailViewController backButtonPressed:
             NSArray<NSString *> *actions = [button actionsForTarget:nil forControlEvent:UIControlEventTouchUpInside];
             for (NSString *actionName in actions) {
                 if ([actionName isEqualToString:@"backButtonPressed:"]) return button;
@@ -964,19 +828,12 @@ static BOOL PDDTryReturnFromDetail(UIWindow *window) {
     UIViewController *top = PDDTopViewController(window.rootViewController);
     UINavigationController *nav = top.navigationController;
     if (nav && nav.viewControllers.count > 1 && top == nav.topViewController) {
-        NSLog(@"[PDDReplica] returning from detail using navigation stack %@", NSStringFromClass(top.class));
         [nav popViewControllerAnimated:YES];
         return YES;
     }
-
-    // DIAG1 found the real control at (20,48,66,44), label=返回,
-    // target=PDDGoodsDetailViewController selector=backButtonPressed:.
-    // Search the active detail controller's own view first, then the window.
     UIButton *back = PDDFindDetailBackButton(top.view);
     if (!back) back = PDDFindDetailBackButton(window);
     if (back) {
-        NSLog(@"[PDDReplica] returning from detail using diagnosed back control %@",
-              NSStringFromClass(top.class));
         BOOL invoked = NO;
         for (id target in back.allTargets) {
             NSArray<NSString *> *actions = [back actionsForTarget:target forControlEvent:UIControlEventTouchUpInside] ?: @[];
@@ -984,7 +841,7 @@ static BOOL PDDTryReturnFromDetail(UIWindow *window) {
                 SEL action = NSSelectorFromString(actionName);
                 if (![actionName isEqualToString:@"backButtonPressed:"] || ![target respondsToSelector:action]) continue;
                 @try { ((void (*)(id, SEL, id))objc_msgSend)(target, action, back); invoked = YES; }
-                @catch (NSException *exception) { NSLog(@"[PDDReplica] direct back action exception: %@", exception.reason); }
+                @catch (NSException *exception) {}
                 break;
             }
             if (invoked) break;
@@ -993,7 +850,6 @@ static BOOL PDDTryReturnFromDetail(UIWindow *window) {
         return YES;
     }
     if (top.presentingViewController) {
-        NSLog(@"[PDDReplica] dismissing modal detail controller %@", NSStringFromClass(top.class));
         [top dismissViewControllerAnimated:YES completion:nil];
         return YES;
     }
@@ -1011,27 +867,37 @@ static void PDDAutoScheduleTick(NSTimeInterval delay) {
 
 static void PDDAutoPause(NSString *reason) {
     gAutoCollectState = 6;
-    NSLog(@"[PDDReplica] auto collector paused: %@", reason ?: @"unknown");
+    PDDDiagEvent(@"auto.paused", @{@"reason": reason ?: @"unknown"});
     PDDShowMessage(@"自動採集已暫停", reason ?: @"目前無法安全繼續。請檢查畫面後再處理。");
 }
 
 static void PDDAutoCollectTick(void) {
     if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ PDDAutoCollectTick(); }); return; }
+    
     NSDictionary *active = PDDActiveTaskSnapshot();
-    if (!active || ![active[@"task_id"] isEqualToString:gAutoSearchTaskID] || !PDDCaptureEnabled()) {
+    if (!active || !PDDCaptureEnabled()) {
         gAutoCollectState = 0; return;
     }
+    
+    // 修正：如果 active_task_id 與 gAutoSearchTaskID 不匹配，不要直接設為 0，而是等待 assign
+    if (![active[@"task_id"] isEqualToString:gAutoSearchTaskID]) {
+        // 這是因為 PDDSetActiveTask 才剛把 active_task_id 換成新的，但非同步的 PDDStartAutoSearchForTask 還沒跑完
+        // 我們只需要重新調度一次，不要殺死狀態
+        if (gAutoCollectState != 0) {
+            PDDAutoScheduleTick(0.5);
+        }
+        return;
+    }
+
     NSUInteger target = [active[@"target_count"] unsignedIntegerValue];
     NSUInteger saved = [active[@"saved_count"] unsignedIntegerValue];
     if (target < 1) target = 1;
     if (target > 3) target = 3;
-    // The final upload must still pass through state 4 so the detail page can
-    // return to results before the active task is released.
+    
     if (saved >= target && gAutoCollectState != 4) {
-        // If the server count is already complete but UI is still in detail,
-        // allow the existing return/upload confirmation path to finish.
         if (gAutoCollectState != 3 && gAutoCollectState != 7) return;
     }
+    
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDAutoPause(@"找不到拼多多活動視窗。"); return; }
 
@@ -1039,7 +905,7 @@ static void PDDAutoCollectTick(void) {
     UICollectionView *collection = nil; NSIndexPath *indexPath = nil; NSString *reason = nil;
     BOOL isResults = PDDFindTestCollection(window, &collection, &indexPath, &reason);
 
-    if (gAutoCollectState == 1) { // wait for search result cards
+    if (gAutoCollectState == 1) {
         if (isDetail) { PDDAutoPause(@"搜尋後意外進入商品詳情頁，為避免誤採集已停止。"); return; }
         if (!isResults) {
             if (++gAutoPhaseTicks > 45) { PDDAutoPause(@"等待搜尋結果超過 45 秒。請確認關鍵詞已成功搜尋，再重新領取任務。"); return; }
@@ -1049,7 +915,7 @@ static void PDDAutoCollectTick(void) {
         gAutoCollectState = 2;
     }
 
-    if (gAutoCollectState == 2) { // choose one visible, not-yet-visited card
+    if (gAutoCollectState == 2) {
         if (isDetail) {
             gAutoCollectState = 3; gAutoPhaseTicks = 0;
             if (gAutoExpectedGoodsID.length) { PDDAutoUploadConfirmed(gAutoExpectedGoodsID); return; }
@@ -1085,13 +951,13 @@ static void PDDAutoCollectTick(void) {
         id delegate = collection.delegate; SEL selector = NSSelectorFromString(@"collectionView:didSelectItemAtIndexPath:");
         if (!delegate || ![delegate respondsToSelector:selector]) { PDDAutoPause(@"商品列表點擊回呼不可用。"); return; }
         gAutoExpectedGoodsID = nil; gAutoPhaseTicks = 0; gAutoCollectState = 7;
-        NSLog(@"[PDDReplica] 1.2.4 opening product indexPath=%@", chosen);
+        PDDDiagEvent(@"opening_product", @{@"indexPath": [chosen description]});
         @try { ((void (*)(id, SEL, UICollectionView *, NSIndexPath *))objc_msgSend)(delegate, selector, collection, chosen); }
         @catch (NSException *exception) { PDDAutoPause([NSString stringWithFormat:@"商品點擊回呼例外：%@", exception.reason ?: @"unknown"]); return; }
         PDDAutoScheduleTick(0.8); return;
     }
 
-    if (gAutoCollectState == 7) { // wait for this exact selection to navigate before selecting anything else
+    if (gAutoCollectState == 7) {
         if (isDetail) {
             gAutoCollectState = 3; gAutoPhaseTicks = 0;
             if (gAutoExpectedGoodsID.length) { PDDAutoUploadConfirmed(gAutoExpectedGoodsID); return; }
@@ -1101,22 +967,19 @@ static void PDDAutoCollectTick(void) {
         PDDAutoScheduleTick(0.8); return;
     }
 
-    if (gAutoCollectState == 3) { // detail page is visible; wait for its raw JSON upload acceptance
+    if (gAutoCollectState == 3) {
         if (!isDetail) { if (++gAutoPhaseTicks > 30) { PDDAutoPause(@"商品詳情頁未能穩定顯示。"); return; } PDDAutoScheduleTick(0.8); return; }
         if (gAutoExpectedGoodsID.length) { PDDAutoUploadConfirmed(gAutoExpectedGoodsID); return; }
         if (++gAutoPhaseTicks > 90) { PDDAutoPause(@"商品詳情頁已打開，但 90 秒內本地伺服器未確認 TXT 上傳。TXT 若已保存仍會保留在手機；請檢查網路與服務設定。"); return; }
         PDDAutoScheduleTick(1.0); return;
     }
 
-    if (gAutoCollectState == 4) { // wait for actual search page after pressing visible back control
+    if (gAutoCollectState == 4) {
         if (isResults && !isDetail) {
-            // The server's final-upload response can arrive before the UI navigation
-            // finishes. Only now is it safe to release this task and let the next
-            // cloud poll claim another one.
             if (gAutoTaskCompletedPendingReturn || saved >= target) {
                 NSString *finishedKeyword = [active[@"keyword"] isKindOfClass:NSString.class] ? active[@"keyword"] : @"";
                 NSUInteger finishedCount = saved;
-                NSLog(@"[PDDReplica] task complete keyword=%@ uploaded=%lu; results page confirmed, releasing task", finishedKeyword, (unsigned long)finishedCount);
+                PDDDiagEvent(@"task.complete", @{@"keyword": finishedKeyword, @"uploaded": @(finishedCount)});
                 PDDClearActiveTask();
                 return;
             }
@@ -1126,7 +989,7 @@ static void PDDAutoCollectTick(void) {
         if (++gAutoPhaseTicks > 30) { PDDAutoPause(@"已觸發詳情頁返回，但未能確認回到搜尋結果頁。"); return; }
         PDDAutoScheduleTick(0.8); return;
     }
-    if (gAutoCollectState == 5) { // required 3-second spacing between operations
+    if (gAutoCollectState == 5) {
         gAutoCollectState = 2; gAutoPhaseTicks = 0;
         PDDAutoScheduleTick(0.2); return;
     }
@@ -1144,7 +1007,6 @@ static void PDDAutoUploadConfirmed(NSString *goodsID) {
             return;
         }
         if (PDDTryReturnFromDetail(window)) {
-            NSLog(@"[PDDReplica] upload confirmed goods_id=%@; return action dispatched", goodsID);
             gAutoCollectState = 4;
             gAutoPhaseTicks = 0;
             PDDAutoScheduleTick(0.8);
@@ -1155,8 +1017,6 @@ static void PDDAutoUploadConfirmed(NSString *goodsID) {
             PDDAutoPause(@"商品已上傳，但目前詳情頁沒有可用的返回按鈕或導覽堆疊。請複製介面診斷以確認實際頁面結構。");
             return;
         }
-        NSLog(@"[PDDReplica] upload confirmed goods_id=%@; return control not ready, retry=%lu",
-              goodsID, (unsigned long)gAutoPhaseTicks);
         PDDAutoScheduleTick(0.8);
     });
 }
@@ -1197,9 +1057,6 @@ static void PDDTestOpenFirstVisibleProduct(void) {
         }
         id delegate = collection.delegate;
         SEL selector = NSSelectorFromString(@"collectionView:didSelectItemAtIndexPath:");
-        NSString *detail = [NSString stringWithFormat:@"READ_ONLY_CHECK=PASSED\nTEST_ACTION=delegate callback\n%@", reason ?: @""];
-        UIPasteboard.generalPasteboard.string = detail;
-        NSLog(@"[PDDReplica] 1.2.3 test invoking product selection callback: %@", detail);
         @try {
             ((void (*)(id, SEL, UICollectionView *, NSIndexPath *))objc_msgSend)(delegate, selector, collection, indexPath);
         } @catch (NSException *exception) {
@@ -1220,7 +1077,6 @@ static void PDDCopyInterfaceDiagnostics(void) {
     if (!window) { PDDShowMessage(@"介面診斷", @"目前找不到活動視窗。請回到拼多多前景後再試。"); return; }
     NSMutableString *report = [NSMutableString stringWithString:@"PDD ReplicaShell interface diagnostics 1.2.4\nREAD_ONLY=YES\n"];
     NSUInteger count = 0;
-    PDDAppendClickPathDiagnostics(window, report, 0, &count);
     [report appendFormat:@"\nVIEW_COUNT=%lu\n", (unsigned long)count];
     UIPasteboard.generalPasteboard.string = report;
     PDDShowMessage(@"點擊路徑診斷已複製", [NSString stringWithFormat:@"已複製點擊路徑資訊（掃描 %@ 個視圖）。不會執行任何點擊。", @(count)]);
@@ -1335,7 +1191,6 @@ static void PDDInstallFloatingButton(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             PDDInstallFloatingButton();
             PDDStartCloudWorker();
-            // Timers run only while the Pinduoduo app is active; iOS may suspend the process in background.
             [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
                 gPresented = NO;
                 PDDInstallFloatingButton();
