@@ -20,12 +20,11 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils clang llvm lld libtool
+          sudo apt-get install -y make git perl libipc-run-perl libssl-dev liblzma-dev libxml2-dev libcurl4-openssl-dev libc6-dev fakeroot xz-utils unzip wget
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
-          # 完整拉取 Theos 及其子模組
           git clone --recursive --depth 1 https://github.com/theos/theos.git $THEOS
           
           # 安裝 ldid
@@ -33,14 +32,10 @@ jobs:
           curl -sL https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64 -o $THEOS/bin/ldid
           chmod +x $THEOS/bin/ldid
           
-          # 建立工具鏈目錄並鏈接系統 LLVM 工具
-          mkdir -p $THEOS/toolchain/linux/iphone/bin
-          ln -sf $(which clang) $THEOS/toolchain/linux/iphone/bin/clang
-          ln -sf $(which clang++) $THEOS/toolchain/linux/iphone/bin/clang++
-          ln -sf $(which ld.lld) $THEOS/toolchain/linux/iphone/bin/ld
-          ln -sf $(which llvm-ar) $THEOS/toolchain/linux/iphone/bin/ar
-          ln -sf $(which llvm-ranlib) $THEOS/toolchain/linux/iphone/bin/ranlib
-          ln -sf $(which llvm-strip) $THEOS/toolchain/linux/iphone/bin/strip
+          # 下載並解壓 Theos 官方 Linux 專用工具鏈（自帶 libc++，完美解決 std 模組報錯）
+          wget -q https://github.com/theos/toolchain/releases/latest/download/linux-x86_64.tar.xz -O /tmp/toolchain.tar.xz
+          mkdir -p $THEOS/toolchain/linux
+          tar -xJf /tmp/toolchain.tar.xz -C $THEOS/toolchain/linux --strip-components=1
           
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           echo "$THEOS/bin" >> $GITHUB_PATH
@@ -56,13 +51,12 @@ jobs:
       - name: Build
         run: |
           make clean || true
-          # 直接編譯 dylib，跳過 deb 打包
+          # 使用 Theos 自帶的工具鏈編譯
           make TARGET=iphone:clang:latest:14.0
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PDDReplicaShell-dylib
-          # 提取編譯好的 dylib
           path: PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
           if-no-files-found: warn
