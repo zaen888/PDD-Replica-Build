@@ -7,89 +7,44 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Install build deps
+      - name: Setup Theos
         run: |
-          sudo apt-get update
-          sudo apt-get install -y curl wget unzip clang llvm xz-utils
+          export THEOS=$HOME/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          
+          # 下載 Theos 官方的 Linux/macOS 通用工具鏈與 ldid
+          curl -sL https://github.com/theos/sdks/archive/refs/heads/master.zip -o sdks.zip
+          unzip -q sdks.zip -d $THEOS/
+          mv $THEOS/sdks-master $THEOS/sdks
+          
+          curl -sL https://github.com/theos/toolchain/releases/latest/download/macos-x86_64.tar.xz -o toolchain.tar.xz
+          mkdir -p $THEOS/toolchain/macos
+          tar -xJf toolchain.tar.xz -C $THEOS/toolchain/macos --strip-components=1
 
-      - name: Download Dependencies
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+      - name: Build Package
         run: |
-          mkdir -p deps
-          cd deps
-          
-          echo "Downloading Logos..."
-          curl -sL --retry 3 -o logos.zip https://github.com/theos/logos/archive/refs/heads/master.zip
-          unzip -q logos.zip
-          
-          echo "Downloading Headers..."
-          curl -sL --retry 3 -o headers.zip https://github.com/theos/headers/archive/refs/heads/master.zip
-          unzip -q headers.zip
-          
-          echo "Downloading substrate.h..."
-          curl -sL --retry 3 -o substrate.h https://raw.githubusercontent.com/theos/headers/master/substrate.h
-          # 強制建立目錄，防止 "Not a directory" 錯誤
-          mkdir -p headers-master/include
-          mv substrate.h headers-master/include/
-          
-          echo "Downloading SDKs..."
-          curl -sL --retry 3 -o sdks.zip https://github.com/theos/sdks/archive/refs/heads/master.zip
-          unzip -q sdks.zip
-          
-          echo "Downloading ldid..."
-          curl -sL --retry 3 -o ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
-          chmod +x ldid
-
-      - name: Build Dylib
-        run: |
-          DEPS="$PWD/deps"
-          SDK_PATH="$DEPS/sdks-master/iPhoneOS15.6.sdk"
-          LOGOS_PL="$DEPS/logos-master/bin/logos.pl"
-          HEADERS="$DEPS/headers-master/include"
-
           cd PDD_iOS_Tweak_Scaffold_v1.2.0
-
-          echo "=== 預處理 Logos ==="
-          perl $LOGOS_PL Tweak.xm > Tweak.mm
-          if [ -f PDDInputHooks.xm ]; then
-            perl $LOGOS_PL PDDInputHooks.xm > PDDInputHooks.mm
-          fi
-
-          SOURCES="PDDDiagnostics.m Tweak.mm"
-          if [ -f PDDInputHooks.mm ]; then
-            SOURCES="$SOURCES PDDInputHooks.mm"
-          fi
-
-          CFLAGS="-isysroot $SDK_PATH \
-            -F$SDK_PATH/System/Library/Frameworks \
-            -F$SDK_PATH/System/Library/PrivateFrameworks \
-            -I$HEADERS -I. \
-            -framework Foundation -framework UIKit -framework CoreFoundation \
-            -Wl,-undefined,dynamic_lookup \
-            -fobjc-arc -fmodules -fblocks -dynamiclib"
-
-          echo "=== 編譯 arm64 ==="
-          clang++ -target arm64-apple-ios14.0 $CFLAGS $SOURCES -o arm64.dylib
-
-          echo "=== 編譯 arm64e ==="
-          clang++ -target arm64e-apple-ios14.0 $CFLAGS $SOURCES -o arm64e.dylib
-
-          echo "=== 合併架構 ==="
-          llvm-lipo -create -output PDDReplicaShell.dylib arm64.dylib arm64e.dylib
-
-          echo "=== 簽名 ==="
-          $DEPS/ldid -S PDDReplicaShell.dylib
           
-          mv PDDReplicaShell.dylib $GITHUB_WORKSPACE/
-          ls -la $GITHUB_WORKSPACE/PDDReplicaShell.dylib
+          # 確保 Makefile 使用正確的目標
+          # 你的 Makefile 已經寫了 TARGET := iphone:clang:latest:14.0，這裡直接 make
+          make clean || true
+          make package FINALPACKAGE=1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PDDReplicaShell-dylib
-          path: PDDReplicaShell.dylib
+          name: PDDReplicaShell-Deb-and-Dylib
+          # 提取打包好的 deb 和編譯出的 dylib
+          path: |
+            PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
+            PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
           if-no-files-found: warn
