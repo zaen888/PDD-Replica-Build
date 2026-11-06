@@ -29,7 +29,7 @@ static const CGPoint kBackPoint           = {30.0, 50.0};   // 详情页左上�
 static NSString * const kDataFolderName = @"PDDGoodsData";
 static NSInteger kFloatingButtonTag = 0x50444452;
 static BOOL gEnabled = YES;
-static BOOL gPresented = NO;
+__attribute__((unused)) static BOOL gPresented = NO;
 static NSString * const kEnabledDefaultsKey = @"PDDReplicaEnabled";
 static NSString * const kCloudServerURLKey = @"PDDReplicaCloudServerURL";
 static NSString * const kCloudDeviceIDKey = @"PDDReplicaCloudDeviceID";
@@ -71,12 +71,12 @@ static UIWindow *PDDActiveWindow(void) {
 }
 
 static NSString *PDDDataDirectory(void);
-static void PDDShowMessage(NSString *title, NSString *message);
+__attribute__((unused)) static void PDDShowMessage(NSString *title, NSString *message);
 static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *taskSnapshot);
 static NSDictionary *PDDActiveTaskSnapshot(void);
 static void PDDStartCloudWorker(void);
 static void PDDShowControlMenu(UIButton *button);
-static void PDDConfigureCloud(void);
+__attribute__((unused)) static void PDDConfigureCloud(void);
 static void PDDAutoCollectTick(void);
 static void PDDAutoScheduleTick(NSTimeInterval delay);
 static void PDDCaptureRawJSON(NSData *data, NSString *goodsID);
