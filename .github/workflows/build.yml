@@ -1,3 +1,4 @@
+
 name: Build PDDReplicaShell
 
 on:
@@ -8,39 +9,73 @@ on:
 jobs:
   build:
     runs-on: macos-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Setup Theos
+      - name: Setup Theos and iOS SDK
+        shell: bash
         run: |
-          export THEOS=$HOME/theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          
-          # 下载官方 iOS SDK
-          git clone https://github.com/theos/sdks.git $THEOS/sdks
-          
-          # 安装 ldid
-          brew install ldid
-          
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          set -e
+
+          export THEOS="$HOME/theos"
+
+          # 重新建立乾淨的 Theos 目錄
+          rm -rf "$THEOS"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+          # 只有在缺少 iPhoneOS SDK 時才重新下載
+          if ! find "$THEOS/sdks" -maxdepth 1 -type d -name 'iPhoneOS*.sdk' -print -quit 2>/dev/null | grep -q .; then
+            echo "iOS SDK missing; downloading..."
+            rm -rf "$THEOS/sdks"
+            git clone https://github.com/theos/sdks.git "$THEOS/sdks"
+          else
+            echo "iOS SDK already exists; skip clone."
+          fi
+
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid
+          fi
+
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Prepare 1.2.4-DIAG1 source
+        shell: bash
+        run: |
+          set -e
+
+          PROJECT_DIR="PDD_iOS_Tweak_Scaffold_v1.2.0"
+          SOURCE_FILE="Tweak_1.2.4_patched_diag1_statefix2.xm"
+
+          test -d "$PROJECT_DIR"
+          test -f "$SOURCE_FILE"
+
+          # 將指定的 1.2.4 修正版放入 Theos 實際建置入口
+          cp "$SOURCE_FILE" "$PROJECT_DIR/Tweak.xm"
+
+          echo "Source installed:"
+          shasum -a 256 "$SOURCE_FILE" "$PROJECT_DIR/Tweak.xm"
+
+          echo "Version markers:"
+          grep -n 'plugin_version' "$PROJECT_DIR/Tweak.xm" || true
 
       - name: Build Package
+        shell: bash
         run: |
-          # 进入你的代码子目录（注意路径千万别写错）
+          set -e
           cd PDD_iOS_Tweak_Scaffold_v1.2.0
-          
-          # 直接执行最标准的打包
-          make clean || true
+
+          make clean
           make package FINALPACKAGE=1
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: PDDReplicaShell-Build
+          name: PDDReplicaShell-1.2.4-DIAG1-statefix2
           path: |
             PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
             PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
-          if-no-files-found: warn
+          if-no-files-found: error
