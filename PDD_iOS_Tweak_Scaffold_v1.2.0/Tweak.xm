@@ -16,7 +16,6 @@ static const NSTimeInterval kCloudPollInterval = 5.0;
 static const NSTimeInterval kCloudHeartbeatInterval = 15.0;
 
 static dispatch_queue_t gCaptureQueue;
-static NSUInteger gCaptureCount = 0;
 static NSString *gActiveTaskID = nil;
 static NSString *gActiveKeyword = nil;
 static NSUInteger gActiveTargetCount = 0;
@@ -69,16 +68,9 @@ static void PDDCaptureRawJSON(NSData *data, NSString *goodsID) {
         NSFileManager *fm = NSFileManager.defaultManager;
         NSString *dir = PDDDataDirectory();
         NSError *error = nil;
-        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&error]) {
-            NSLog(@"[PDDReplica] create directory failed: %@", error.localizedDescription);
-            return;
-        }
+        if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&error]) return;
         NSString *path = [dir stringByAppendingPathComponent:[goodsID stringByAppendingPathExtension:@"txt"]];
-        if (![snapshot writeToFile:path options:NSDataWritingAtomic error:&error]) {
-            NSLog(@"[PDDReplica] write failed for %@: %@", goodsID, error.localizedDescription);
-            return;
-        }
-        @synchronized ([UIApplication class]) { gCaptureCount++; }
+        if (![snapshot writeToFile:path options:NSDataWritingAtomic error:&error]) return;
         NSLog(@"[PDDReplica] saved product JSON id=%@ bytes=%lu", goodsID, (unsigned long)snapshot.length);
         PDDQueueCloudUpload(snapshot, goodsID, taskSnapshot);
     });
