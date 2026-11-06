@@ -40,11 +40,27 @@ static NSTimeInterval gLastHeartbeat = 0;
 static NSMutableSet<NSString *> *gUploadingPaths = nil;
 static BOOL gUploadBusy = NO;
 
-// 自动化状态机
 static NSInteger gAutoCollectState = 0; 
-// 0=空闲, 1=点搜索框, 2=输入并提交, 3=等结果, 4=点商品1, 5=等抓包1, 6=点返回, 7=点商品2, 8=等抓包2, 9=结束重置
 static NSString *gAutoSearchTaskID = nil;
 static NSUInteger gAutoPhaseTicks = 0;
+
+@class PDDActionProxy;
+
+static UIWindow *PDDActiveWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class]) continue;
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            for (UIWindow *window in windowScene.windows) {
+                if (window.isKeyWindow) return window;
+            }
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
+}
 
 static NSString *PDDDataDirectory(void);
 static void PDDShowMessage(NSString *title, NSString *message);
@@ -58,16 +74,17 @@ static void PDDAutoScheduleTick(NSTimeInterval delay);
 static void PDDCaptureRawJSON(NSData *data, NSString *goodsID);
 static BOOL PDDLooksLikeGoodsObject(id object, NSString **goodsIDOut);
 static NSString *PDDSafeGoodsID(id value);
+static void PDDFlushPendingUploads(void);
 
 // ==========================================
-// 3. 随机延迟与坐标抖动（防风控核心）
+// 3. 随机延迟与坐标抖动
 // ==========================================
 static NSTimeInterval PDDRandomDelay(CGFloat min, CGFloat max) {
     return min + (max - min) * ((CGFloat)arc4random_uniform(1000) / 1000.0);
 }
 
 static CGPoint PDDJitterPoint(CGPoint center) {
-    CGFloat range = 15.0;
+    CGFloat range = 15.0; 
     CGFloat dx = ((CGFloat)arc4random_uniform(2000) / 1000.0 - 1.0) * range;
     CGFloat dy = ((CGFloat)arc4random_uniform(2000) / 1000.0 - 1.0) * range;
     return CGPointMake(center.x + dx, center.y + dy);
@@ -75,19 +92,7 @@ static CGPoint PDDJitterPoint(CGPoint center) {
 
 static void PDDSimulateTap(CGPoint basePoint) {
     CGPoint finalPoint = PDDJitterPoint(basePoint);
-    
-    UIWindow *window = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:UIWindowScene.class]) {
-                for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                    if (w.isKeyWindow) { window = w; break; }
-                }
-            }
-            if (window) break;
-        }
-    }
-    if (!window) window = UIApplication.sharedApplication.keyWindow;
+    UIWindow *window = PDDActiveWindow();
     if (!window) return;
 
     UITouch *touch = [[UITouch alloc] init];
@@ -105,14 +110,10 @@ static void PDDSimulateTap(CGPoint basePoint) {
     PDDDiagEvent(@"simulate_tap", @{@"x": @(finalPoint.x), @"y": @(finalPoint.y)});
 }
 
-// ==========================================
-// 4. 模拟输入文字
-// ==========================================
 static BOOL PDDForceInputKeyword(NSString *keyword) {
-    UIWindow *window = UIApplication.sharedApplication.keyWindow;
+    UIWindow *window = PDDActiveWindow();
     UITextField *target = nil;
     NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
-    
     while (stack.count) {
         UIView *v = stack.lastObject; [stack removeLastObject];
         if ([v isKindOfClass:UITextField.class] && v.isFirstResponder) {
@@ -120,24 +121,20 @@ static BOOL PDDForceInputKeyword(NSString *keyword) {
         }
         for (UIView *child in v.subviews) [stack addObject:child];
     }
-    
     if (target) {
         target.text = @"";
         [target sendActionsForControlEvents:UIControlEventEditingChanged];
-        
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(PDDRandomDelay(0.3, 0.8) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             target.text = keyword;
             [target sendActionsForControlEvents:UIControlEventEditingChanged];
-            PDDDiagEvent(@"force_input_ok", @{@"keyword": keyword});
         });
         return YES;
     }
-    PDDDiagEvent(@"force_input_failed", @{@"keyword": keyword});
     return NO;
 }
 
 // ==========================================
-// 5. 状态机核心
+// 4. 状态机
 // ==========================================
 static void PDDAutoScheduleTick(NSTimeInterval delay) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(0.1, delay) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -161,14 +158,12 @@ static void PDDAutoCollectTick(void) {
         PDDAutoScheduleTick(PDDRandomDelay(1.0, 3.0));
         return;
     }
-    
     if (gAutoCollectState == 1) {
         PDDSimulateTap(kSearchBoxPoint);
         gAutoCollectState = 2;
         PDDAutoScheduleTick(PDDRandomDelay(1.0, 2.0)); 
         return;
     }
-    
     if (gAutoCollectState == 2) {
         if (PDDForceInputKeyword(active[@"keyword"])) {
             gAutoCollectState = 3;
@@ -181,20 +176,17 @@ static void PDDAutoCollectTick(void) {
         }
         return;
     }
-    
     if (gAutoCollectState == 3) {
         gAutoCollectState = 4;
         PDDAutoScheduleTick(PDDRandomDelay(1.0, 2.5)); 
         return;
     }
-    
     if (gAutoCollectState == 4) {
         PDDSimulateTap(kGoods1Point);
         gAutoCollectState = 5;
         PDDAutoScheduleTick(PDDRandomDelay(3.0, 6.0)); 
         return;
     }
-    
     if (gAutoCollectState == 5) {
         if (saved >= 1) {
             gAutoCollectState = 6;
@@ -205,14 +197,12 @@ static void PDDAutoCollectTick(void) {
         }
         return;
     }
-    
     if (gAutoCollectState == 6) {
         PDDSimulateTap(kBackPoint);
         gAutoCollectState = 7;
         PDDAutoScheduleTick(PDDRandomDelay(2.0, 3.5));
         return;
     }
-    
     if (gAutoCollectState == 7) {
         if (saved < target) {
             PDDSimulateTap(kGoods1Point); 
@@ -223,7 +213,6 @@ static void PDDAutoCollectTick(void) {
         }
         return;
     }
-    
     if (gAutoCollectState == 8) {
         if (saved >= target) {
             gAutoCollectState = 9;
@@ -234,7 +223,6 @@ static void PDDAutoCollectTick(void) {
         }
         return;
     }
-    
     if (gAutoCollectState == 9) {
         PDDSimulateTap(kBackPoint);
         gAutoCollectState = 0;
@@ -244,7 +232,7 @@ static void PDDAutoCollectTick(void) {
 }
 
 // ==========================================
-// 6. 工具与网络代码 (保留你之前的逻辑)
+// 5. 工具函数与网络上传
 // ==========================================
 static BOOL PDDCaptureEnabled(void) { return gEnabled; }
 
@@ -338,6 +326,64 @@ static void PDDCloudRequest(NSString *path, NSDictionary *body, void (^completio
     }] resume];
 }
 
+static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *task) {
+    if (!task || !data.length || !goodsID.length) return;
+    dispatch_async(gCaptureQueue, ^{
+        NSString *dir = [PDDDataDirectory() stringByAppendingPathComponent:@"PendingUploads"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSMutableDictionary *envelope = [NSMutableDictionary dictionary];
+        envelope[@"task_id"] = task[@"task_id"];
+        envelope[@"goods_id"] = goodsID;
+        envelope[@"captured_at"] = [[NSDate date] description];
+        envelope[@"source"] = @"NSJSONSerialization";
+        envelope[@"raw_json_base64"] = [data base64EncodedStringWithOptions:0];
+        NSData *json = [NSJSONSerialization dataWithJSONObject:envelope options:0 error:nil];
+        if (!json) return;
+        NSString *filename = [NSString stringWithFormat:@"%@-%@.json", task[@"task_id"], NSUUID.UUID.UUIDString];
+        NSString *path = [dir stringByAppendingPathComponent:filename];
+        if (![json writeToFile:path options:NSDataWritingAtomic error:nil]) return;
+        PDDFlushPendingUploads();
+    });
+}
+
+static void PDDFlushPendingUploads(void) {
+    @synchronized ([UIApplication class]) { if (gUploadBusy) return; }
+    NSString *dir = [PDDDataDirectory() stringByAppendingPathComponent:@"PendingUploads"];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    for (NSString *name in [files sortedArrayUsingSelector:@selector(compare:)]) {
+        if (![name.pathExtension.lowercaseString isEqualToString:@"json"]) continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        @synchronized ([UIApplication class]) {
+            if (gUploadBusy || [gUploadingPaths containsObject:path]) return;
+            gUploadBusy = YES;
+            [gUploadingPaths addObject:path];
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSData *fileData = [NSData dataWithContentsOfFile:path];
+            NSDictionary *envelope = nil;
+            if (fileData) {
+                id parsed = [NSJSONSerialization JSONObjectWithData:fileData options:NSJSONReadingMutableContainers error:nil];
+                if ([parsed isKindOfClass:NSDictionary.class]) envelope = parsed;
+            }
+            if (![envelope isKindOfClass:NSDictionary.class]) {
+                @synchronized ([UIApplication class]) { gUploadBusy = NO; [gUploadingPaths removeObject:path]; }
+                return;
+            }
+            PDDCloudRequest(@"/api/v1/device/captures", envelope, ^(NSDictionary *result, NSError *error, NSInteger statusCode) {
+                BOOL success = !error && statusCode >= 200 && statusCode < 300 && [result[@"ok"] boolValue];
+                if (success) {
+                    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+                    NSUInteger saved = [result[@"saved_count"] respondsToSelector:@selector(unsignedIntegerValue)] ? [result[@"saved_count"] unsignedIntegerValue] : 0;
+                    @synchronized ([UIApplication class]) { gActiveSavedCount = saved; }
+                }
+                @synchronized ([UIApplication class]) { gUploadBusy = NO; [gUploadingPaths removeObject:path]; }
+                if (success) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ PDDFlushPendingUploads(); });
+            });
+        });
+        return;
+    }
+}
+
 static void PDDStartCloudWorker(void) {
     if (!PDDCloudConfigured()) return;
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -346,12 +392,8 @@ static void PDDStartCloudWorker(void) {
     });
 }
 
-static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *task) {
-    // 网络上传逻辑（保持你原有的实现）
-}
-
 // ==========================================
-// 7. 菜单与主 Hook
+// 6. 菜单与主 Hook
 // ==========================================
 @interface PDDActionProxy : NSObject
 + (instancetype)shared;
@@ -365,7 +407,7 @@ static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *t
 - (void)toggle:(UIButton *)button { PDDShowControlMenu(button); }
 - (void)drag:(UIPanGestureRecognizer *)gesture {
     UIView *view = gesture.view;
-    UIWindow *window = UIApplication.sharedApplication.keyWindow;
+    UIWindow *window = PDDActiveWindow();
     if (!view || !window) return;
     CGPoint delta = [gesture translationInView:window];
     CGPoint center = view.center;
@@ -377,7 +419,32 @@ static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *t
     [gesture setTranslation:CGPointZero inView:window];
 }
 - (void)cloudTick:(NSTimer *)timer {
-    // 心跳和任务领取逻辑（保留你原有的代码）
+    if (!PDDCloudConfigured()) return;
+    NSTimeInterval current = [NSDate date].timeIntervalSince1970;
+    if (!gHeartbeatInFlight && (current - gLastHeartbeat >= kCloudHeartbeatInterval)) {
+        gHeartbeatInFlight = YES;
+        PDDCloudRequest(@"/api/v1/device/heartbeat", @{}, ^(NSDictionary *result, NSError *error, NSInteger statusCode) {
+            dispatch_async(dispatch_get_main_queue(), ^{ gHeartbeatInFlight = NO; gLastHeartbeat = [NSDate date].timeIntervalSince1970; });
+        });
+    }
+    if (PDDCaptureEnabled() && !gClaimInFlight) {
+        gClaimInFlight = YES;
+        PDDCloudRequest(@"/api/v1/device/tasks/claim", @{}, ^(NSDictionary *result, NSError *error, NSInteger statusCode) {
+            dispatch_async(dispatch_get_main_queue(), ^{ gClaimInFlight = NO; });
+            if (error || statusCode < 200 || statusCode >= 300) return;
+            NSDictionary *task = [result[@"task"] isKindOfClass:NSDictionary.class] ? result[@"task"] : nil;
+            if (task) {
+                @synchronized ([UIApplication class]) {
+                    gActiveTaskID = task[@"task_id"];
+                    gActiveKeyword = task[@"keyword"];
+                    gActiveTargetCount = [task[@"target_count"] unsignedIntegerValue];
+                    gActiveSavedCount = [task[@"saved_count"] unsignedIntegerValue];
+                }
+                if (gAutoCollectState == 0) PDDAutoScheduleTick(1.0);
+            }
+        });
+    }
+    PDDFlushPendingUploads();
 }
 @end
 
@@ -394,6 +461,28 @@ static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *t
 }
 %end
 
+static void PDDShowControlMenu(UIButton *button) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *window = PDDActiveWindow();
+        UIViewController *presenter = window.rootViewController;
+        if (!presenter) return;
+        while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+        
+        NSString *captureState = gEnabled ? @"暫停自動採集" : @"啟用自動採集";
+        UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"PDD Auto" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+        [menu addAction:[UIAlertAction actionWithTitle:captureState style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
+            gEnabled = !gEnabled;
+            if (gEnabled && gAutoCollectState == 0) PDDAutoScheduleTick(1.0);
+        }]];
+        [menu addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        
+        if (menu.popoverPresentationController) {
+            menu.popoverPresentationController.sourceView = button ?: presenter.view;
+        }
+        [presenter presentViewController:menu animated:YES completion:nil];
+    });
+}
+
 %ctor {
     @autoreleasepool {
         [[PDDDiagnostics shared] start];
@@ -401,8 +490,23 @@ static void PDDQueueCloudUpload(NSData *data, NSString *goodsID, NSDictionary *t
         gUploadingPaths = [NSMutableSet set];
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            // 悬浮窗初始化
+            UIWindow *window = PDDActiveWindow();
+            if (window) {
+                UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+                button.tag = kFloatingButtonTag;
+                button.frame = CGRectMake(MAX(8.0, window.bounds.size.width - 92.0), window.safeAreaInsets.top + 180.0, 84.0, 44.0);
+                button.backgroundColor = [UIColor colorWithRed:0.15 green:0.35 blue:0.85 alpha:0.92];
+                [button setTitle:@"PDD · ON" forState:UIControlStateNormal];
+                [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+                button.layer.cornerRadius = 12.0;
+                [button addTarget:[PDDActionProxy shared] action:@selector(toggle:) forControlEvents:UIControlEventTouchUpInside];
+                
+                UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[PDDActionProxy shared] action:@selector(drag:)];
+                [button addGestureRecognizer:pan];
+                [window addSubview:button];
+            }
             PDDStartCloudWorker();
-            // 悬浮窗启动逻辑（保留你原有的）
         });
     }
 }
