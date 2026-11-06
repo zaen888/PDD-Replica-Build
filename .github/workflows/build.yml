@@ -11,34 +11,28 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup Theos
         run: |
           export THEOS=$HOME/theos
-          
-          # 1. 拉取 Theos 本體與子模組
           git clone --recursive https://github.com/theos/theos.git $THEOS
           
-          # 2. 如果 sdks 資料夾不存在（或者為空），才拉取；否則直接跳過
-          if [ ! -d "$THEOS/sdks" ] || [ -z "$(ls -A $THEOS/sdks)" ]; then
-            echo "Downloading sdks..."
-            rm -rf $THEOS/sdks
-            git clone https://github.com/theos/sdks.git $THEOS/sdks
-          else
-            echo "sdks already exists, skipping clone."
-          fi
+          # 下载官方 iOS SDK
+          git clone https://github.com/theos/sdks.git $THEOS/sdks
           
-          # 3. 安裝 ldid
+          # 安装 ldid
           brew install ldid
           
           echo "THEOS=$THEOS" >> $GITHUB_ENV
 
       - name: Build Package
         run: |
-          # 進入源碼目錄
+          # 进入你的代码子目录（注意路径千万别写错）
           cd PDD_iOS_Tweak_Scaffold_v1.2.0
           
-          # 直接執行編譯打包
+          # 直接执行最标准的打包
           make clean || true
           make package FINALPACKAGE=1
 
@@ -46,7 +40,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PDDReplicaShell-Build
-          # 確保這兩個路徑都能被正確提取
           path: |
             PDD_iOS_Tweak_Scaffold_v1.2.0/packages/*.deb
             PDD_iOS_Tweak_Scaffold_v1.2.0/.theos/obj/**/*.dylib
