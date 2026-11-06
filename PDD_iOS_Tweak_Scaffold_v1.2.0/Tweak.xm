@@ -685,7 +685,14 @@ static void PDDCloudTick(void) {
                     });
                 }
             } else if (PDDActiveTaskSnapshot()) {
-                PDDClearActiveTask(); // server-side task was stopped or lease was released
+                // An empty claim response is not enough to clear a task while the
+                // final upload is navigating back to search results. The server
+                // may stop offering the task before the UI return has completed.
+                if (gAutoCollectState == 4 || gAutoTaskCompletedPendingReturn) {
+                    NSLog(@"[PDDReplica] empty claim ignored while final task return is pending");
+                } else {
+                    PDDClearActiveTask(); // server-side task was stopped or lease was released
+                }
             }
         });
     }
@@ -971,9 +978,7 @@ static void PDDAutoCollectTick(void) {
     NSUInteger saved = [active[@"saved_count"] unsignedIntegerValue];
     if (target < 1) target = 1;
     if (target > 3) target = 3;
-    // Do not stop the return-navigation state after the final upload.
-    // State 4 must confirm that the UI is back on the search-results page
-    // before the completed task can be cleared.
+    // Keep state 4 alive until the UI is confirmed back on search results.
     if (saved >= target && gAutoCollectState != 4) return;
     UIWindow *window = PDDActiveWindow();
     if (!window) { PDDAutoPause(@"找不到拼多多活動視窗。"); return; }
