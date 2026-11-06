@@ -14,7 +14,17 @@ static const CGPoint kGoods1Point         = {105.0, 490.0}; // 列表左上角�
 static const CGPoint kBackPoint           = {30.0, 50.0};   // 详情页左上角返回键
 
 // ==========================================
-// 2. 全局配置与状态
+// 2. 提前声明 PDDActionProxy 类
+// ==========================================
+@interface PDDActionProxy : NSObject
++ (instancetype)shared;
+- (void)toggle:(UIButton *)button;
+- (void)drag:(UIPanGestureRecognizer *)gesture;
+- (void)cloudTick:(NSTimer *)timer;
+@end
+
+// ==========================================
+// 3. 全局配置与状态
 // ==========================================
 static NSString * const kDataFolderName = @"PDDGoodsData";
 static NSInteger kFloatingButtonTag = 0x50444452;
@@ -43,8 +53,6 @@ static BOOL gUploadBusy = NO;
 static NSInteger gAutoCollectState = 0; 
 static NSString *gAutoSearchTaskID = nil;
 static NSUInteger gAutoPhaseTicks = 0;
-
-@class PDDActionProxy;
 
 static UIWindow *PDDActiveWindow(void) {
     if (@available(iOS 13.0, *)) {
@@ -77,7 +85,7 @@ static NSString *PDDSafeGoodsID(id value);
 static void PDDFlushPendingUploads(void);
 
 // ==========================================
-// 3. 随机延迟与坐标抖动
+// 4. 随机延迟与坐标抖动
 // ==========================================
 static NSTimeInterval PDDRandomDelay(CGFloat min, CGFloat max) {
     return min + (max - min) * ((CGFloat)arc4random_uniform(1000) / 1000.0);
@@ -134,7 +142,7 @@ static BOOL PDDForceInputKeyword(NSString *keyword) {
 }
 
 // ==========================================
-// 4. 状态机
+// 5. 状态机
 // ==========================================
 static void PDDAutoScheduleTick(NSTimeInterval delay) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(0.1, delay) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -232,7 +240,7 @@ static void PDDAutoCollectTick(void) {
 }
 
 // ==========================================
-// 5. 工具函数与网络上传
+// 6. 工具函数与网络上传
 // ==========================================
 static BOOL PDDCaptureEnabled(void) { return gEnabled; }
 
@@ -393,15 +401,8 @@ static void PDDStartCloudWorker(void) {
 }
 
 // ==========================================
-// 6. 菜单与主 Hook
+// 7. PDDActionProxy 实现
 // ==========================================
-@interface PDDActionProxy : NSObject
-+ (instancetype)shared;
-- (void)toggle:(UIButton *)button;
-- (void)drag:(UIPanGestureRecognizer *)gesture;
-- (void)cloudTick:(NSTimer *)timer;
-@end
-
 @implementation PDDActionProxy
 + (instancetype)shared { static PDDActionProxy *p; static dispatch_once_t once; dispatch_once(&once, ^{ p = [PDDActionProxy new]; }); return p; }
 - (void)toggle:(UIButton *)button { PDDShowControlMenu(button); }
@@ -490,7 +491,6 @@ static void PDDShowControlMenu(UIButton *button) {
         gUploadingPaths = [NSMutableSet set];
         
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            // 悬浮窗初始化
             UIWindow *window = PDDActiveWindow();
             if (window) {
                 UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
