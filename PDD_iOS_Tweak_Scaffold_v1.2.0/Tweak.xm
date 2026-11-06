@@ -85,7 +85,7 @@ static NSString *PDDSafeGoodsID(id value);
 static void PDDFlushPendingUploads(void);
 
 // ==========================================
-// 4. 随机延迟与坐标抖动
+// 4. 随机延迟与坐标抖动（防风控核心）
 // ==========================================
 static NSTimeInterval PDDRandomDelay(CGFloat min, CGFloat max) {
     return min + (max - min) * ((CGFloat)arc4random_uniform(1000) / 1000.0);
@@ -98,24 +98,45 @@ static CGPoint PDDJitterPoint(CGPoint center) {
     return CGPointMake(center.x + dx, center.y + dy);
 }
 
+// 【修改过的安全点击逻辑】：不再强塞 UIEvent，而是通过 hitTest 派发给具体控件
 static void PDDSimulateTap(CGPoint basePoint) {
+    if (basePoint.x <= 0 || basePoint.y <= 0) return;
+
     CGPoint finalPoint = PDDJitterPoint(basePoint);
     UIWindow *window = PDDActiveWindow();
     if (!window) return;
 
+    UIView *hitView = [window hitTest:finalPoint withEvent:nil];
+    if (!hitView) {
+        PDDDiagEvent(@"simulate_tap_failed", @{@"reason": @"hitView is nil"});
+        return;
+    }
+
     UITouch *touch = [[UITouch alloc] init];
+    [touch setValue:hitView forKey:@"_view"];
     [touch setValue:window forKey:@"_window"];
     [touch setValue:@(finalPoint) forKey:@"_locationInWindow"];
     [touch setValue:@(finalPoint) forKey:@"_preciseLocationInWindow"];
-    [touch setValue:@(0) forKey:@"_phase"];
-    [touch setValue:@(0) forKey:@"_tapCount"];
     [touch setValue:[NSDate date] forKey:@"_timestamp"];
     
-    UIEvent *event = [[UIEvent alloc] init];
-    [event setValue:[NSArray arrayWithObject:touch] forKey:@"_touches"];
+    [touch setValue:@(0) forKey:@"_phase"]; // Began
+    [hitView touchesBegan:[NSSet setWithObject:touch] withEvent:nil];
     
-    [window sendEvent:event];
-    PDDDiagEvent(@"simulate_tap", @{@"x": @(finalPoint.x), @"y": @(finalPoint.y)});
+    PDDDiagEvent(@"simulate_tap_down", @{@"x": @(finalPoint.x), @"y": @(finalPoint.y)});
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [touch setValue:@(3) forKey:@"_phase"]; // Ended
+        [touch setValue:[NSDate date] forKey:@"_timestamp"];
+        
+        [hitView touchesEnded:[NSSet setWithObject:touch] withEvent:nil];
+        
+        PDDDiagEvent(@"simulate_tap_up", @{@"x": @(finalPoint.x), @"y": @(finalPoint.y)});
+        
+        if ([hitView isKindOfClass:[UIControl class]]) {
+            UIControl *control = (UIControl *)hitView;
+            [control sendActionsForControlEvents:UIControlEventTouchUpInside];
+        }
+    });
 }
 
 static BOOL PDDForceInputKeyword(NSString *keyword) {
